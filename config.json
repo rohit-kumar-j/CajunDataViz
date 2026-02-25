@@ -224,7 +224,5 @@
     }
   },
   "custom_channels": {
-    "my_signal": "myrecordeddata.txt",
-    "another":   "someotherfile.txt"
   }
 }
