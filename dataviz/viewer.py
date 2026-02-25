@@ -189,13 +189,30 @@ def run_viewer(
         from imgui.integrations.opengl import ProgrammablePipelineRenderer as _Rend
         _renderer = _Rend()
 
+
     def _set_display_size(w: int, h: int) -> None:
         try:
+            try:
+                fbw, fbh = win.get_framebuffer_size()
+            except Exception:
+                fbw, fbh = w, h
+            scale_x = fbw / w if w > 0 else 1.0
+            scale_y = fbh / h if h > 0 else 1.0
             _io.display_size = (w, h)
-        except Exception:
-            pass
+            _io.display_framebuffer_scale = (scale_x, scale_y)
+        except Exception as exc:
+            logger.warning(f"[viewer] _set_display_size failed: {exc}")
+            try:
+                _io.display_size = (w, h)
+            except Exception:
+                pass
 
-    _set_display_size(W, H)
+
+    try:
+        _fbw, _fbh = win.get_framebuffer_size()
+    except Exception:
+        _fbw, _fbh = W, H
+    _set_display_size(_fbw, _fbh)
 
     # ── Shared UI state ───────────────────────────────────────────────────
     ui = make_ui_state()
@@ -259,7 +276,11 @@ def run_viewer(
         glBindFramebuffer(GL_FRAMEBUFFER, 0)
 
         glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND)
-        glViewport(0, 0, win.width, win.height)
+        try:
+            _vp_w, _vp_h = win.get_framebuffer_size()
+        except Exception:
+            _vp_w, _vp_h = win.width, win.height
+        glViewport(0, 0, _vp_w, _vp_h)
 
         tex_id = int(tab.fbo_tex.value)
         _ui_image(tex_id, rw, rh)
@@ -408,7 +429,12 @@ def run_viewer(
         while _fbo_delete_queue:
             _delete_fbo_safe(_fbo_delete_queue.pop(0))
 
-        _set_display_size(win.width, win.height)
+        try:
+            _fbw, _fbh = win.get_framebuffer_size()
+        except Exception:
+            _fbw, _fbh = win.width, win.height
+        _set_display_size(_fbw, _fbh)
+
         ui.set_font_scale()
         imgui.new_frame()
 
@@ -563,9 +589,14 @@ def run_viewer(
             logger.info("[viewer] ESC pressed — closing")
             win.close()
 
+
     @win.event
     def on_resize(width, height):
-        _set_display_size(width, height)
+        try:
+            fbw, fbh = win.get_framebuffer_size()
+        except Exception:
+            fbw, fbh = width, height
+        _set_display_size(fbw, fbh)
 
     @win.event
     def on_draw():
