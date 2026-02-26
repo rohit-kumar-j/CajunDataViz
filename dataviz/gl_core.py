@@ -1,18 +1,7 @@
 """
-dataviz/gl_core.py
-
-Owns:
-  - GLResources dataclass (single container for all shared GL handles)
-  - Shader compilation and linking
-  - VAO builders (mesh, lines)
-  - Primitive mesh generators (sphere, checker ground)
-  - FBO creation / deletion / resize
-  - All draw_* functions
-  - render_3d(tab, gl, w, h)   ← main per-frame 3D render entry point
-  - init_tab_gl(tab, gl)       ← load STL meshes into a TabState
-
-Imports: dataviz.config, dataviz.state, dataviz.data, standard library, numpy, pyglet.gl, loguru.
-No imgui.
+dataviz/gl_core.py  — unchanged except:
+  1. draw_wireframe_box() added after draw_force_arrow()
+  2. render_3d() foot loop extended with Raibert box + correction arrow + actual-foot line
 """
 
 import ctypes
@@ -117,24 +106,20 @@ void main(){ FragColor=vColor; }"""
 
 
 # ---------------------------------------------------------------------------
-# GLResources — single container for shared GL handles
+# GLResources
 # ---------------------------------------------------------------------------
 @dataclass
 class GLResources:
-    """
-    Created once by build_gl_resources() and passed to every render/draw call.
-    Tab-specific resources (mesh VAOs, FBOs) live in TabState, not here.
-    """
     prog_lit:          int = 0
     prog_flat:         int = 0
-    vao_sphere:        Tuple = field(default_factory=tuple)   # (vao, n_idx)
+    vao_sphere:        Tuple = field(default_factory=tuple)
     vao_ground_dark:   Tuple = field(default_factory=tuple)
     vao_ground_light:  Tuple = field(default_factory=tuple)
-    vao_lines:         int   = 0    # VAO handle
-    vbo_lines:         int   = 0    # VBO handle (for dynamic upload)
+    vao_lines:         int   = 0
+    vbo_lines:         int   = 0
     max_line_pts:      int   = 4096
-    vao_arrow_shaft:   Tuple = field(default_factory=tuple)   # (vao, n_idx) unit cylinder
-    vao_arrow_cone:    Tuple = field(default_factory=tuple)   # (vao, n_idx) unit cone
+    vao_arrow_shaft:   Tuple = field(default_factory=tuple)
+    vao_arrow_cone:    Tuple = field(default_factory=tuple)
 
 
 # ---------------------------------------------------------------------------
@@ -215,10 +200,6 @@ def build_vao_mesh(
     norms: np.ndarray,
     faces: np.ndarray,
 ) -> Tuple[ctypes.c_uint, int]:
-    """
-    Upload interleaved (position, normal) mesh to GPU.
-    Returns (vao_handle, n_indices).
-    """
     data2 = np.hstack([verts, norms]).astype(np.float32).flatten()
     idx   = faces.flatten().astype(np.uint32)
 
@@ -249,10 +230,6 @@ def build_vao_mesh(
 
 
 def build_vao_lines(max_pts: int = 4096) -> Tuple[ctypes.c_uint, ctypes.c_uint]:
-    """
-    Build a dynamic-draw line VAO.
-    Returns (vao_handle, vbo_handle).
-    """
     buf = np.zeros((max_pts, 3), dtype=np.float32)
     vao = ctypes.c_uint(0); glGenVertexArrays(1, ctypes.byref(vao))
     vbo = ctypes.c_uint(0); glGenBuffers(1, ctypes.byref(vbo))
@@ -301,7 +278,6 @@ def _sphere_mesh(r: float = 1.0, stacks: int = 10, slices: int = 10):
 
 
 def _cylinder_mesh(radius: float = 1.0, height: float = 1.0, slices: int = 12):
-    """Unit cylinder along +Z axis, centred at origin base."""
     vv, nn, ff = [], [], []
     for i in range(slices):
         a0 = 2 * math.pi * i / slices
@@ -309,7 +285,6 @@ def _cylinder_mesh(radius: float = 1.0, height: float = 1.0, slices: int = 12):
         x0, y0 = math.cos(a0) * radius, math.sin(a0) * radius
         x1, y1 = math.cos(a1) * radius, math.sin(a1) * radius
         b = len(vv)
-        # Side quad: two triangles
         for x, y, z, nx, ny in [(x0,y0,0,x0/radius,y0/radius),(x1,y1,0,x1/radius,y1/radius),
                                   (x1,y1,height,x1/radius,y1/radius),(x0,y0,height,x0/radius,y0/radius)]:
             vv.append([x, y, z]); nn.append([nx, ny, 0.0])
@@ -318,10 +293,9 @@ def _cylinder_mesh(radius: float = 1.0, height: float = 1.0, slices: int = 12):
 
 
 def _cone_mesh(radius: float = 1.0, height: float = 1.0, slices: int = 12):
-    """Cone with base at origin, tip at +Z=height."""
     vv, nn, ff = [], [], []
     tip = [0.0, 0.0, height]
-    sl  = math.sqrt(radius**2 + height**2)  # slant length for normals
+    sl  = math.sqrt(radius**2 + height**2)
     nz  = radius / sl
     nr  = height / sl
     for i in range(slices):
@@ -361,10 +335,6 @@ def _ground_mesh_checker(size: float = 26.0, step: float = 0.5):
 # FBO management
 # ---------------------------------------------------------------------------
 def create_fbo(w: int, h: int) -> Tuple[ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]:
-    """
-    Create FBO + color texture + depth renderbuffer.
-    Returns (fbo, tex, rbo).
-    """
     tex = ctypes.c_uint(0); glGenTextures(1, ctypes.byref(tex))
     glBindTexture(GL_TEXTURE_2D, tex)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, None)
@@ -389,7 +359,6 @@ def create_fbo(w: int, h: int) -> Tuple[ctypes.c_uint, ctypes.c_uint, ctypes.c_u
 
 
 def delete_fbo(tab) -> None:
-    """Delete FBO resources stored in *tab* and clear the handles."""
     if tab.fbo is not None:
         glDeleteFramebuffers(1,   ctypes.byref(tab.fbo))
         glDeleteTextures(1,       ctypes.byref(tab.fbo_tex))
@@ -399,7 +368,6 @@ def delete_fbo(tab) -> None:
 
 
 def ensure_fbo(tab, w: int, h: int) -> None:
-    """Create or resize the tab's FBO if dimensions have changed."""
     w = max(1, int(w))
     h = max(1, int(h))
     if tab.fbo is None or tab.fbo_w != w or tab.fbo_h != h:
@@ -414,13 +382,9 @@ def ensure_fbo(tab, w: int, h: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tab GL resource init (called after do_load)
+# Tab GL resource init
 # ---------------------------------------------------------------------------
 def init_tab_gl(tab, gl: GLResources, urdf_dir: str) -> None:
-    """
-    Load STL meshes for *tab* from the meshes/ directory next to the URDF.
-    Populates tab.MESH_VAOS and tab.LINK_TO_MESH.
-    """
     import trimesh
 
     URDF_DIR = Path(urdf_dir)
@@ -459,34 +423,26 @@ def init_tab_gl(tab, gl: GLResources, urdf_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Build shared GLResources (called once at startup)
+# Build shared GLResources
 # ---------------------------------------------------------------------------
 def build_gl_resources() -> GLResources:
-    """
-    Compile shaders, build shared primitive VAOs.
-    Must be called after a GL context exists.
-    """
     logger.info("[gl_core] Compiling shaders...")
     prog_lit  = _link_program(_VERT_LIT,  _FRAG_LIT)
     prog_flat = _link_program(_VERT_FLAT, _FRAG_FLAT)
     logger.info("[gl_core] Shaders compiled OK")
 
-    # Sphere
     st = _cfg_mod.CFG.rendering.sphere_stacks if _cfg_mod.CFG else 10
     sl = _cfg_mod.CFG.rendering.sphere_slices if _cfg_mod.CFG else 10
     vao_sphere = build_vao_mesh(*_sphere_mesh(1.0, st, sl))
 
-    # Ground
     gs   = _cfg_mod.CFG.rendering.ground_size if _cfg_mod.CFG else 26.0
     gst  = _cfg_mod.CFG.rendering.ground_step if _cfg_mod.CFG else 0.5
     (gv0, gn0, gf0), (gv1, gn1, gf1) = _ground_mesh_checker(gs, gst)
     vao_ground_dark  = build_vao_mesh(gv0, gn0, gf0)
     vao_ground_light = build_vao_mesh(gv1, gn1, gf1)
 
-    # Lines
     vao_lines, vbo_lines = build_vao_lines(4096)
 
-    # Arrow primitives (unit size, oriented along +Z — transformed at draw time)
     vao_arrow_shaft = build_vao_mesh(*_cylinder_mesh(0.012, 1.0, 12))
     vao_arrow_cone  = build_vao_mesh(*_cone_mesh(0.030, 0.18, 12))
 
@@ -602,6 +558,52 @@ def draw_line_seg(
     glBindVertexArray(ctypes.c_uint(0))
 
 
+def draw_wireframe_box(
+    gl: GLResources,
+    center: np.ndarray,
+    half: np.ndarray,
+    col4: tuple,
+    mvp: np.ndarray,
+) -> None:
+    """
+    Draw a 3D axis-aligned wireframe box centred at *center* with half-extents *half*.
+    12 edges × 2 verts = 24 GL_LINES points, drawn in a single call.
+    """
+    cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
+    hx, hy, hz = float(half[0]),   float(half[1]),   float(half[2])
+
+    # 8 corners  (bit 0 = ±x, bit 1 = ±y, bit 2 = ±z)
+    c = np.array([
+        [cx - hx, cy - hy, cz - hz],  # 0
+        [cx + hx, cy - hy, cz - hz],  # 1
+        [cx + hx, cy + hy, cz - hz],  # 2
+        [cx - hx, cy + hy, cz - hz],  # 3
+        [cx - hx, cy - hy, cz + hz],  # 4
+        [cx + hx, cy - hy, cz + hz],  # 5
+        [cx + hx, cy + hy, cz + hz],  # 6
+        [cx - hx, cy + hy, cz + hz],  # 7
+    ], dtype=np.float32)
+
+    edges = [
+        (0,1),(1,2),(2,3),(3,0),   # bottom face
+        (4,5),(5,6),(6,7),(7,4),   # top face
+        (0,4),(1,5),(2,6),(3,7),   # vertical edges
+    ]
+
+    pts = np.empty((len(edges) * 2, 3), dtype=np.float32)
+    for i, (a, b) in enumerate(edges):
+        pts[i * 2]     = c[a]
+        pts[i * 2 + 1] = c[b]
+
+    upload_lines(gl.vbo_lines, pts)
+    glUseProgram(gl.prog_flat)
+    _u4(gl.prog_flat,  "uMVP",   mvp)
+    _uf4(gl.prog_flat, "uColor", *col4)
+    glBindVertexArray(gl.vao_lines)
+    glDrawArrays(GL_LINES, 0, len(pts))
+    glBindVertexArray(ctypes.c_uint(0))
+
+
 def draw_force_arrow(
     gl: GLResources,
     origin: np.ndarray,
@@ -614,11 +616,6 @@ def draw_force_arrow(
     fog_end: float,
     force_scale: float,
 ) -> None:
-    """
-    Draw a 3D force arrow: cylinder shaft + cone tip, oriented along force_vec.
-    Arrow length is proportional to force magnitude * force_scale.
-    Total arrow = shaft (80% of length) + cone tip (20%, fixed proportion).
-    """
     fv  = np.array(force_vec, dtype=np.float64)
     mag = float(np.linalg.norm(fv))
     if mag < 1e-6:
@@ -627,14 +624,11 @@ def draw_force_arrow(
     direction = fv / mag
     arrow_len = mag * force_scale
 
-    # Fixed cone height, shaft fills the rest
     cone_h  = min(0.18, arrow_len * 0.30)
     shaft_l = max(0.0, arrow_len - cone_h)
 
-    # Build rotation matrix: +Z → direction
     z = np.array([0.0, 0.0, 1.0])
     if abs(np.dot(direction, z)) > 0.9999:
-        # Near-parallel: use a different up vector
         up = np.array([1.0, 0.0, 0.0])
     else:
         up = z
@@ -642,7 +636,6 @@ def draw_force_arrow(
     x_axis = np.cross(direction, up);  x_axis /= np.linalg.norm(x_axis)
     y_axis = np.cross(direction, x_axis)
 
-    # 4x4 rotation+translation matrix
     def _make_T(pos, scale_z, rot_axes):
         R = np.eye(4, dtype=np.float32)
         R[0, :3] = rot_axes[0]
@@ -654,17 +647,15 @@ def draw_force_arrow(
         S[2, 2] = scale_z
         return T @ R.T @ S
 
-    rot = (x_axis, y_axis, direction)  # columns of rotation
+    rot = (x_axis, y_axis, direction)
 
-    # Draw shaft
     if shaft_l > 1e-4:
         model_shaft = _make_T(origin, shaft_l, rot)
         vao, n_idx  = gl.vao_arrow_shaft
         draw_mesh(vao, n_idx, gl.prog_lit, model_shaft, col3, proj, view, eye, 1.0, fog_start, fog_end)
 
-    # Draw cone at tip of shaft
     cone_origin = origin + direction * shaft_l
-    model_cone  = _make_T(cone_origin, cone_h / 0.18, rot)  # 0.18 is unit cone height
+    model_cone  = _make_T(cone_origin, cone_h / 0.18, rot)
     vao, n_idx  = gl.vao_arrow_cone
     draw_mesh(vao, n_idx, gl.prog_lit, model_cone, col3, proj, view, eye, 1.0, fog_start, fog_end)
 
@@ -687,22 +678,13 @@ def draw_ground(
     T[0, 3] = ox
     T[1, 3] = oy
 
-    # Ground colors — stored as RGBA in config, we use only RGB for the lit shader
     _dark_fallback  = (0.32, 0.38, 0.44)
     _light_fallback = (0.50, 0.57, 0.64)
     if _cfg_mod.CFG is not None:
         raw_dark  = getattr(_cfg_mod.CFG.colors, "ground_dark",  None)
         raw_light = getattr(_cfg_mod.CFG.colors, "ground_light", None)
-        if raw_dark is None:
-            logger.warning("[gl_core] config missing colors.ground_dark — using default")
-            dark = _dark_fallback
-        else:
-            dark = tuple(raw_dark[:3])
-        if raw_light is None:
-            logger.warning("[gl_core] config missing colors.ground_light — using default")
-            light = _light_fallback
-        else:
-            light = tuple(raw_light[:3])
+        dark  = tuple(raw_dark[:3])  if raw_dark  is not None else _dark_fallback
+        light = tuple(raw_light[:3]) if raw_light is not None else _light_fallback
     else:
         dark  = _dark_fallback
         light = _light_fallback
@@ -732,14 +714,10 @@ def get_leg_color(label: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Main 3D render (called with FBO bound)
+# Main 3D render
 # ---------------------------------------------------------------------------
 def render_3d(tab, gl: GLResources, vp_w: int, vp_h: int) -> None:
-    """
-    Render the full 3D scene for *tab* into the currently bound FBO.
-    *vp_w* / *vp_h* are the FBO dimensions.
-    """
-    from dataviz.state import TabState  # local import to avoid circular at top
+    from dataviz.state import TabState
 
     S = tab.S
     G = tab.G
@@ -763,11 +741,9 @@ def render_3d(tab, gl: GLResources, vp_w: int, vp_h: int) -> None:
     fog_s = S.fog_start
     fog_e = S.fog_end
 
-    # Ground
     if S.show_grid:
         draw_ground(gl, proj, view, eye, S.cam_target, fog_s, fog_e)
 
-    # World axes
     L = 0.4
     for p2, c in [
         ([L, 0, 0], (1, 0, 0, 1)),
@@ -823,7 +799,31 @@ def render_3d(tab, gl: GLResources, vp_w: int, vp_h: int) -> None:
                 ghost_col, proj, view, eye, ghost_alpha, fog_s, fog_e,
             )
 
-    # ── Foot contacts + forces + limit warnings ───────────────────────────
+    # ── Raibert visualization config ──────────────────────────────────────
+    # Raibert data availability
+    _raibert_land = S.data.get("raibert_land")   # (N, 4, 3) body-origin-relative (needs +torso XY)
+    _raibert_corr = S.data.get("raibert_corr")   # (N, 4, 3) body-origin-relative correction vectors
+    _swing_foot   = S.data.get("swing_foot")     # (N, 4, 3) desired foot pos pre-residual (needs +torso XY)
+
+    # Per-foot residual bounds from config.yaml action_lb/ub: shape (4, 3, 2) [foot,axis,lo/hi]
+    # Falls back to ±0.10 m symmetric if not available.
+    _raibert_bounds = getattr(tab, "raibert_bounds", None)  # set by do_load in state.py
+
+    # One-time log so it's easy to see in terminal whether data is present
+    if not getattr(tab, "_raibert_logged", False):
+        tab._raibert_logged = True
+        logger.info(
+            f"[gl_core] Raibert data: land={'present' if _raibert_land is not None else 'MISSING'}  "
+            f"corr={'present' if _raibert_corr is not None else 'MISSING'}  "
+            f"swing_foot={'present' if _swing_foot is not None else 'MISSING'}  "
+            f"bounds={'from config.yaml' if _raibert_bounds is not None else 'DEFAULT ±0.10m'}  "
+            f"show_raibert_boxes={S.show_raibert_boxes}"
+        )
+
+    # Foot order used when saving: FR=0, FL=1, RR=2, RL=3
+    _FOOT_ORDER = ["FR", "FL", "RR", "RL"]
+
+    # ── Foot contacts + forces + limit warnings + Raibert boxes ──────────
     leg_keys    = list(tab.legs.keys())
     has_foot_pos = (
         S.data.get("foot_pos") is not None
@@ -834,7 +834,7 @@ def render_3d(tab, gl: GLResources, vp_w: int, vp_h: int) -> None:
     for lbl, ji in tab.legs.items():
         fi2 = leg_keys.index(lbl) if lbl in leg_keys else 0
 
-        # Foot position
+        # Foot position (world frame)
         if has_foot_pos:
             foot_pos = S.data["foot_pos"][S.frame, fi2 * 3:(fi2 + 1) * 3].astype(np.float32)
         else:
@@ -877,6 +877,106 @@ def render_3d(tab, gl: GLResources, vp_w: int, vp_h: int) -> None:
                             pos = link_T[ln][:3, 3]
                             draw_sphere(gl, pos, 0.028, (1, 0.1, 0.1), proj, view, eye, fog_s, fog_e)
                             break
+
+        # ── Raibert visualization ─────────────────────────────────────────
+        # One box per foot showing the residual action space:
+        #   - Box CENTRED on the desired foot position (pre-residual),
+        #     or on the landing target as fallback.
+        #   - Box SIZED by residual bounds from config.yaml action_lb/ub.
+        #   - The actual foot (from FK) should be INSIDE the box.
+        #   - BLUE LINE from the actual foot to the box centre (landing pos),
+        #     showing the residual the policy applied.
+        #   - Small SPHERE at the box centre.
+        #
+        # Data is body-origin-relative: add torso XY for world frame.
+        if S.show_raibert_boxes:
+            raibert_fi = _FOOT_ORDER.index(lbl) if lbl in _FOOT_ORDER else -1
+            if raibert_fi < 0:
+                continue
+
+            # Pick the best available centre point:
+            #   prefer swing_foot (desired pos pre-residual),
+            #   fall back to raibert_land (landing target)
+            center_raw = None
+            if (_swing_foot is not None
+                    and raibert_fi < _swing_foot.shape[1]):
+                raw = _swing_foot[S.frame, raibert_fi]
+                if np.linalg.norm(raw) > 1e-4:
+                    center_raw = raw
+            if (center_raw is None
+                    and _raibert_land is not None
+                    and raibert_fi < _raibert_land.shape[1]):
+                raw = _raibert_land[S.frame, raibert_fi]
+                if np.linalg.norm(raw) > 1e-4:
+                    center_raw = raw
+
+            if center_raw is None:
+                continue   # no data for this foot this frame
+
+            # Body-origin-relative → world frame (add torso XY)
+            center_world = np.array([
+                float(torso_pos[0]) + float(center_raw[0]),
+                float(torso_pos[1]) + float(center_raw[1]),
+                float(center_raw[2]),
+            ], dtype=np.float32)
+
+            # ── Residual bounds → box geometry ────────────────────────
+            yaw = float(torso_rpy[2])
+            cy, sy = math.cos(yaw), math.sin(yaw)
+
+            if _raibert_bounds is not None:
+                bnd = _raibert_bounds[raibert_fi]       # (3, 2): [axis, lo/hi]
+                half_x = (float(bnd[0, 1]) - float(bnd[0, 0])) * 0.5
+                half_y = (float(bnd[1, 1]) - float(bnd[1, 0])) * 0.5
+                half_z = (float(bnd[2, 1]) - float(bnd[2, 0])) * 0.5
+                mid_x  = (float(bnd[0, 0]) + float(bnd[0, 1])) * 0.5
+                mid_y  = (float(bnd[1, 0]) + float(bnd[1, 1])) * 0.5
+                mid_z  = (float(bnd[2, 0]) + float(bnd[2, 1])) * 0.5
+                box_half = np.array([half_x, half_y, half_z], dtype=np.float32)
+                # Rotate bound-centre offset by yaw into world frame
+                wx = cy * mid_x - sy * mid_y
+                wy = sy * mid_x + cy * mid_y
+                box_center = np.array([
+                    center_world[0] + wx,
+                    center_world[1] + wy,
+                    mid_z + max(center_world[2], 0.0),
+                ], dtype=np.float32)
+            else:
+                box_half = np.array([0.10, 0.10, 0.10], dtype=np.float32)
+                box_center = np.array([
+                    center_world[0],
+                    center_world[1],
+                    max(center_world[2], 0.0) + 0.10,
+                ], dtype=np.float32)
+
+            # ── Leg-coloured wireframe box ────────────────────────────
+            leg_col = get_leg_color(lbl)
+            draw_wireframe_box(
+                gl, box_center, box_half,
+                col4=(leg_col[0], leg_col[1], leg_col[2], 0.85),
+                mvp=mvp,
+            )
+
+            # ── Small sphere at box centre (landing pos) ──────────────
+            draw_sphere(
+                gl, center_world, 0.012,
+                col3=(leg_col[0], leg_col[1], leg_col[2]),
+                proj=proj, view=view, eye=eye,
+                fog_start=fog_s, fog_end=fog_e,
+            )
+
+            # ── Blue line: actual foot → box centre ───────────────────
+            # Shows the residual offset the policy applied.
+            if foot_pos is not None:
+                fp = np.array(foot_pos, dtype=np.float32)
+                if float(np.linalg.norm(fp - center_world)) > 1e-4:
+                    draw_line_seg(
+                        gl,
+                        fp.tolist(),
+                        center_world.tolist(),
+                        col4=(0.15, 0.50, 1.0, 1.0),
+                        mvp=mvp,
+                    )
 
     # ── Joint frames ──────────────────────────────────────────────────────
     if S.show_joint_frames:

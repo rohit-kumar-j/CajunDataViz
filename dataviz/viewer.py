@@ -63,6 +63,7 @@ from dataviz.gl_core   import (
 from dataviz.ui_panels import (
     UIState, make_ui_state,
     draw_picker, render_graphs, render_settings, render_timeline,
+    render_config_panel,
     draw_new_graph_modal,
     _ui_begin, _ui_begin_child, _ui_button, _ui_image,
     _ui_get_cursor_screen_pos, _ui_get_content_region_avail,
@@ -345,31 +346,58 @@ def run_viewer(
 
         graph_h    = max(sc(80),   int(top_h * tab.graph_h_frac))
         settings_h = max(sc(60),   top_h - graph_h - SPLITTER_W)
-        # Reserve space for the + New Graph button bar below the scrollable graphs
+        # Reserve space for the button bar below the scrollable graphs/config
         btn_bar_h  = sc(30)
         scroll_h   = max(sc(60), graph_h - btn_bar_h)
 
         _ui_begin_child(f"##graphs{tab.id}", 0, scroll_h, False,
                         imgui.WindowFlags_.horizontal_scrollbar)
+
+        # ── Toggle button: "Config" ↔ "Live Graphs" ──────────────────────
+        # When showing graphs → button label is "Config"   (click to switch)
+        # When showing config → button label is "Live Graphs" (click to switch)
+        show_cfg = getattr(tab, "show_config_panel", False)
+        toggle_lbl = "Config##cfgtog" if not show_cfg else "Live Graphs##cfgtog"
+        _ui_push_style_color(imgui.Col_.button,
+                             *(0.28, 0.48, 0.80, 0.80) if not show_cfg
+                              else (0.22, 0.58, 0.38, 0.80))
+        _ui_push_style_color(imgui.Col_.button_hovered,
+                             *(0.40, 0.60, 1.00, 1.00) if not show_cfg
+                              else (0.28, 0.75, 0.50, 1.00))
+        _ui_push_style_color(imgui.Col_.button_active,
+                             *(0.50, 0.70, 1.00, 1.00) if not show_cfg
+                              else (0.35, 0.85, 0.60, 1.00))
+        if _ui_button(toggle_lbl, sc(110), sc(22)):
+            tab.show_config_panel = not show_cfg
+            show_cfg = tab.show_config_panel
+        imgui.pop_style_color(3)
+
+        imgui.same_line()
         if _ui_button("Save Layout##sl"): save_layout(tab, ui, win)
         imgui.same_line()
         if _ui_button("Load Layout##ll"): load_layout(tab, ui, win)
         imgui.separator()
-        render_graphs(tab, right_w - 8, ui)
+
+        if not show_cfg:
+            render_graphs(tab, right_w - 8, ui)
+        else:
+            render_config_panel(tab, right_w - 8, scroll_h - sc(40), ui)
+
         imgui.end_child()
 
-        # + New Graph always visible below the scroll area
+        # + New Graph button only visible when showing graphs
         imgui.separator()
-        if _ui_button("+ New Graph##ng", sc(130), sc(24)):
-            from dataviz.ui_panels import _new_graph_modal
-            _new_graph_modal["open"]        = True
-            _new_graph_modal["_needs_open"] = True
-            _new_graph_modal["tab_id"]      = tab.id
-            _new_graph_modal["search"]      = ""
-            _new_graph_modal["checked"]     = {pk: False for pk in tab.PARAM_KEYS}
-            _new_graph_modal["title"]       = "New Graph"
-            _new_graph_modal["y_min_str"]   = "-30"
-            _new_graph_modal["y_max_str"]   = "30"
+        if not show_cfg:
+            if _ui_button("+ New Graph##ng", sc(130), sc(24)):
+                from dataviz.ui_panels import _new_graph_modal
+                _new_graph_modal["open"]        = True
+                _new_graph_modal["_needs_open"] = True
+                _new_graph_modal["tab_id"]      = tab.id
+                _new_graph_modal["search"]      = ""
+                _new_graph_modal["checked"]     = {pk: False for pk in tab.PARAM_KEYS}
+                _new_graph_modal["title"]       = "New Graph"
+                _new_graph_modal["y_min_str"]   = "-30"
+                _new_graph_modal["y_max_str"]   = "30"
 
         # Splitter inside right panel
         _ui_push_style_color(imgui.Col_.button,         0.22, 0.22, 0.26, 0.7)
@@ -611,7 +639,10 @@ def run_viewer(
             if t.S.data is not None and len(t.S.data["time"]) > 1:
                 dt_sim = float(t.S.data["time"][1] - t.S.data["time"][0])
                 t.G.advance_graph(t.S.n_frames, t.S.play_speed, dt_sim)
-            if t.G.play_mode == "main" and not t.G.frozen:
+            # In realtime mode always follow S.frame; otherwise only in main mode
+            if getattr(t.S, "realtime_mode", False) and t.S.playing:
+                t.G.frame = t.S.frame
+            elif t.G.play_mode == "main" and not t.G.frozen:
                 t.G.frame = t.S.frame
             t.S.update_cam()
 

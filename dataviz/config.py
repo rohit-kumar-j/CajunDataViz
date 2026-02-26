@@ -109,6 +109,10 @@ _DEFAULTS: dict = {
             "y_min": -20.0, "y_max": 20.0,
         },
     },
+    # graphs: viewer graph panel settings
+    "graphs": {
+        "y_axis_ticks": 5,   # number of numeric tick labels on the y-axis
+    },
     # custom_channels: name -> filename in data dir. Empty by default.
     # Example: {"my_signal": "myrecordeddata.txt"}
     "custom_channels": {},

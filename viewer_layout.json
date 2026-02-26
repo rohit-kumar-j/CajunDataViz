@@ -1,8 +1,8 @@
 {
-  "vp_frac": 0.2,
-  "bot_frac": 0.5,
+  "vp_frac": 0.42567567567567566,
+  "bot_frac": 0.22,
   "ui_scale": 1.0,
-  "invert_y": false,
-  "win_w": 1269,
-  "win_h": 1045
+  "invert_y": true,
+  "win_w": 1480,
+  "win_h": 860
 }

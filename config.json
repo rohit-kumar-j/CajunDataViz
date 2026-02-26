@@ -221,8 +221,42 @@
       ],
       "y_min": -50.0,
       "y_max": 500.0
+    },
+    "Raibert Correction X (m)": {
+      "series": [
+        "raibert_corr_FR_x",
+        "raibert_corr_FL_x",
+        "raibert_corr_RR_x",
+        "raibert_corr_RL_x"
+      ],
+      "y_min": -0.3,
+      "y_max": 0.3
+    },
+    "Raibert Correction Y (m)": {
+      "series": [
+        "raibert_corr_FR_y",
+        "raibert_corr_FL_y",
+        "raibert_corr_RR_y",
+        "raibert_corr_RL_y"
+      ],
+      "y_min": -0.3,
+      "y_max": 0.3
+    },
+    "Raibert Correction Z (m)": {
+      "series": [
+        "raibert_corr_FR_z",
+        "raibert_corr_FL_z",
+        "raibert_corr_RR_z",
+        "raibert_corr_RL_z"
+      ],
+      "y_min": -0.3,
+      "y_max": 0.3
     }
   },
-  "custom_channels": {
-  }
+  "graphs": {
+    "_comment": "y_axis_ticks: number of numeric tick labels on y-axis of each graph panel",
+    "y_axis_ticks": 5
+  },
+  "_comment_custom": "custom_channels: map arbitrary display names to .txt filenames in the data directory. Each file must contain one scalar value per line matching the frame count.",
+  "custom_channels": {}
 }

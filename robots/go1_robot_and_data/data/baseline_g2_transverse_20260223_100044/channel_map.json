@@ -70,5 +70,7 @@
   "foot_pos_8": null,
   "foot_pos_9": null,
   "foot_pos_10": null,
-  "foot_pos_11": null
+  "foot_pos_11": null,
+  "extra:desPosTorso10": "desPosTorso10.txt",
+  "extra:desPosTorso9": "desPosTorso9.txt"
 }

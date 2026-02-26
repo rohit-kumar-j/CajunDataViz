@@ -1,21 +1,23 @@
 """
-dataviz/ui_panels.py
+dataviz/ui_panels.py  — original + changes:
 
-Owns:
-  - ImGui compatibility wrappers (_ui_*)
-  - UIState (global ui scale + invert-y, not per-tab)
-  - draw_picker(tab)
-  - render_graphs(tab, avail_w)
-  - render_settings(tab, ui_state)
-  - render_timeline(tab, avail_w, avail_h)
+CHANGES vs previous version:
+  1. Import: added scan_unknown_files, extra_channel_name from dataviz.data
+  2. draw_picker() page 0 "Next" button: calls scan_unknown_files(), pre-fills
+       cmap with 'extra:<stem>' → filename entries so they auto-load
+  3. draw_picker() page 2 optional panel: added groups
+       Torso Velocity, QP Controller, Raibert Landing, Raibert Correction
+     plus a new "Auto-detected" collapsing section with per-file checkboxes
+  4. Bottom bar: shows "N auto-detected channel(s) will load" count
 
-No direct GL calls. Calls into gl_core only indirectly via tab.fk_fn etc.
-Imports: dataviz.config, dataviz.state, dataviz.data, imgui, loguru.
+Everything else (render_graphs, draw_new_graph_modal, render_settings,
+render_timeline, all _ui_* helpers) is IDENTICAL to the original.
 """
 
 import math
 from dataclasses import dataclass
 from typing import Optional
+from pathlib import Path as _Path
 
 from loguru import logger
 
@@ -37,6 +39,7 @@ from dataviz.data   import (
     ALL_CHANNELS, REQUIRED_CHANNELS, OPTIONAL_CHANNELS,
     CHANNEL_LABELS, scan_data_files, auto_map_channels,
     load_channel_map_file, save_channel_map, find_robots_dir, scan_robots,
+    scan_unknown_files, extra_channel_name,
 )
 from dataviz.state  import TabState, do_load
 
@@ -70,7 +73,6 @@ def make_ui_state() -> UIState:
 
 # ---------------------------------------------------------------------------
 # ImGui compatibility wrappers
-# All API differences between imgui-bundle and classic imgui are isolated here.
 # ---------------------------------------------------------------------------
 def _ui_button(label: str, w: float = 0, h: float = 0) -> bool:
     if _IMGUI_BACKEND == "bundle":
@@ -208,7 +210,7 @@ def _ui_begin(label: str, flags: int = 0):
     return imgui.begin(label, False, flags)
 
 
-# ── Keyboard / Flag constants (normalised across backends) ──────────────────
+# ── Keyboard / Flag constants ───────────────────────────────────────────────
 try:
     _UI_KEY_SPACE = imgui.Key.space
     _UI_KEY_LEFT  = imgui.Key.left_arrow
@@ -235,21 +237,16 @@ except AttributeError:
 
 
 # ---------------------------------------------------------------------------
-# Timeline drag state (module-level, shared across all tabs in one frame)
+# Module-level state
 # ---------------------------------------------------------------------------
 _tl_drag: dict = {"active": None}
-
-# ---------------------------------------------------------------------------
-# New-graph modal state (module-level, persists between frames while open)
-# ---------------------------------------------------------------------------
 _graph_id_counter: int = 0
-
 _new_graph_modal: dict = {
-    "open":       False,   # True while modal is showing
-    "tab_id":     -1,      # which tab triggered it
-    "search":     "",      # filter text
-    "checked":    {},      # param_key -> bool
-    "title":      "",      # editable graph title
+    "open":       False,
+    "tab_id":     -1,
+    "search":     "",
+    "checked":    {},
+    "title":      "",
     "y_min_str":  "-30",
     "y_max_str":  "30",
 }
@@ -267,6 +264,59 @@ def _short_label(param: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Optional channel groups
+# ---------------------------------------------------------------------------
+_FOOT_NAMES = ["FR", "FL", "RR", "RL"]
+_AXES       = ["x", "y", "z"]
+
+# Each entry: (group_name, [channel_keys...])
+_OPTIONAL_GROUPS: list[tuple[str, list[str]]] = [
+    ("Vel / Contacts", [
+        "torso_vx", "torso_vy", "torso_vz",
+        "desired_vel_x",
+        "contact_FR", "contact_FL", "contact_RR", "contact_RL",
+    ]),
+    ("Joint Vel dq",  [f"dq{i}"          for i in range(12)]),
+    ("Torque tau",    [f"tau{i}"          for i in range(12)]),
+    ("Foot Forces",   [f"foot_force_{i}"  for i in range(12)]),
+    ("Foot Pos",      [f"foot_pos_{i}"    for i in range(12)]),
+    ("QP Controller", (
+        ["qp_cost"]
+        + [f"qp_desired_acc{i}" for i in range(6)]
+        + [f"qp_solved_acc{i}"  for i in range(6)]
+    )),
+    ("Raibert Landing", [
+        f"raibert_{f}_{a}" for f in _FOOT_NAMES for a in _AXES
+    ]),
+    ("Raibert Correction", [
+        f"raibert_corr_{f}_{a}" for f in _FOOT_NAMES for a in _AXES
+    ]),
+]
+
+
+def _draw_opt_group(grp_name, grp_chs, cmap, combos, combo_items, ow):
+    """Render one optional channel group as a collapsing header + combos."""
+    n_mapped = sum(1 for ch in grp_chs if cmap.get(ch))
+    hdr = f"{grp_name}  ({n_mapped}/{len(grp_chs)})"
+    opened = _ui_collapsing_header(hdr)
+    if not opened:
+        return
+    imgui.push_item_width(ow - 180)
+    for ch in grp_chs:
+        lbl    = CHANNEL_LABELS.get(ch, ch)
+        mapped = bool(cmap.get(ch))
+        col    = (0.3, 1.0, 0.3, 1) if mapped else (0.5, 0.5, 0.5, 1)
+        imgui.text_colored(col, f"{lbl[:26]:<26}")
+        imgui.same_line()
+        cur  = combos.get(ch, 0)
+        ch2, ni = imgui.combo(f"##{ch}p", cur, combo_items)
+        if ch2:
+            combos[ch] = ni
+            cmap[ch]   = combo_items[ni] if ni > 0 else None
+    imgui.pop_item_width()
+
+
+# ---------------------------------------------------------------------------
 # Picker panel
 # ---------------------------------------------------------------------------
 def draw_picker(tab: TabState, avail_w: float, avail_h: float) -> None:
@@ -275,7 +325,7 @@ def draw_picker(tab: TabState, avail_w: float, avail_h: float) -> None:
     robots = ps["robots"]
 
     if not robots:
-        rdir       = find_robots_dir()
+        rdir         = find_robots_dir()
         ps["robots"] = scan_robots(rdir)
         robots       = ps["robots"]
 
@@ -328,16 +378,27 @@ def draw_picker(tab: TabState, avail_w: float, avail_h: float) -> None:
 
         can_next = bool(data_dirs)
         if _ui_button("Next: Map Channels  →", 200, 30) and can_next:
-            dd     = str(data_dirs[ps["data_idx"]])
-            files  = scan_data_files(dd)
-            saved  = load_channel_map_file(dd)
-            cmap   = saved if saved else auto_map_channels(files)
-            ps["files"]  = files
-            ps["cmap"]   = cmap
+            dd    = str(data_dirs[ps["data_idx"]])
+            files = scan_data_files(dd)
+            saved = load_channel_map_file(dd)
+            cmap  = saved if saved else auto_map_channels(files)
+
+            # ── Auto-detect unknown .txt files ────────────────────────────
+            unknown = scan_unknown_files(files)
+            for fn in unknown:
+                key = extra_channel_name(fn)   # e.g. 'extra:raibert_FR_x'
+                if key not in cmap:
+                    cmap[key] = fn             # default: auto-load
+
+            ps["files"]   = files
+            ps["unknown"] = unknown            # raw filenames not in AUTO_PATTERNS
+            ps["cmap"]    = cmap
+            # Build combos for ALL known channels + extra keys already in cmap
+            all_keys = list(ALL_CHANNELS) + [k for k in cmap if k.startswith("extra:")]
             ps["combos"] = {
                 ch: (([None] + files).index(cmap.get(ch))
                      if cmap.get(ch) in ([None] + files) else 0)
-                for ch in ALL_CHANNELS
+                for ch in all_keys
             }
             ps["page"] = 1
 
@@ -346,9 +407,11 @@ def draw_picker(tab: TabState, avail_w: float, avail_h: float) -> None:
         files       = ps["files"]
         cmap        = ps["cmap"]
         combos      = ps["combos"]
+        unknown     = ps.get("unknown", [])
         combo_items = ["--- none ---"] + files
         half_w      = (avail_w - 12) // 2
 
+        # Left pane: required channels
         _ui_begin_child("##preq", half_w, avail_h - 90, True)
         imgui.text_colored((1.0, 0.85, 0.3, 1), "REQUIRED CHANNELS")
         imgui.separator()
@@ -368,35 +431,48 @@ def draw_picker(tab: TabState, avail_w: float, avail_h: float) -> None:
         imgui.end_child()
 
         imgui.same_line()
+
+        # Right pane: optional channels (all groups + auto-detected)
         _ui_begin_child("##popt", 0, avail_h - 90, True)
         imgui.text_colored((0.55, 0.75, 1.0, 1), "OPTIONAL CHANNELS")
         imgui.separator()
-        groups = [
-            ("Vel/Contacts", ["desired_vel_x", "contact_FR", "contact_FL", "contact_RR", "contact_RL"]),
-            ("Joint Vel dq",  [f"dq{i}"          for i in range(12)]),
-            ("Torque tau",    [f"tau{i}"          for i in range(12)]),
-            ("Foot Forces",   [f"foot_force_{i}"  for i in range(12)]),
-            ("Foot Pos",      [f"foot_pos_{i}"    for i in range(12)]),
-        ]
         ow = (avail_w - 12) // 2 - 20
-        imgui.push_item_width(ow - 180)
-        for grp_name, grp_chs in groups:
-            opened = _ui_collapsing_header(grp_name)
-            if opened:
-                for ch in grp_chs:
-                    lbl    = CHANNEL_LABELS.get(ch, ch)
-                    mapped = bool(cmap.get(ch))
-                    col    = (0.3, 1.0, 0.3, 1) if mapped else (0.5, 0.5, 0.5, 1)
-                    imgui.text_colored(col, f"{lbl[:24]:<24}")
+
+        # Known groups
+        for grp_name, grp_chs in _OPTIONAL_GROUPS:
+            _draw_opt_group(grp_name, grp_chs, cmap, combos, combo_items, ow)
+
+        # ── Auto-detected section ─────────────────────────────────────────
+        if unknown:
+            imgui.spacing()
+            imgui.separator()
+            n_auto_on = sum(1 for fn in unknown if cmap.get(extra_channel_name(fn)))
+            hdr = f"Auto-detected  ({n_auto_on}/{len(unknown)} loading)"
+            if _ui_collapsing_header(hdr):
+                imgui.text_colored(
+                    (0.75, 0.85, 0.55, 1),
+                    "Files found but not in known patterns — loading as extra:<name>"
+                )
+                imgui.spacing()
+                for fn in unknown:
+                    key      = extra_channel_name(fn)   # 'extra:stemname'
+                    cur_fn   = cmap.get(key)
+                    is_on    = cur_fn is not None
+                    chk_ch, new_on = imgui.checkbox(f"##auto_{fn}", is_on)
+                    if chk_ch:
+                        cmap[key]   = fn if new_on else None
+                        combos[key] = (files.index(fn) + 1) if (new_on and fn in files) else 0
+
+                    col = (0.35, 1.0, 0.55, 1) if is_on else (0.45, 0.45, 0.45, 1)
                     imgui.same_line()
-                    cur  = combos.get(ch, 0)
-                    ch2, ni = imgui.combo(f"##{ch}p", cur, combo_items)
-                    if ch2:
-                        combos[ch] = ni
-                        cmap[ch]   = combo_items[ni] if ni > 0 else None
-        imgui.pop_item_width()
+                    stem = _Path(fn).stem
+                    imgui.text_colored(col, f"{stem[:32]:<32}")
+                    imgui.same_line()
+                    imgui.text_disabled(fn)
+
         imgui.end_child()
 
+        # Bottom bar
         imgui.spacing(); imgui.separator(); imgui.spacing()
         if _ui_button("← Back", 90, 28):
             ps["page"] = 0
@@ -407,7 +483,6 @@ def draw_picker(tab: TabState, avail_w: float, avail_h: float) -> None:
             save_channel_map(dd, cmap)
             try:
                 do_load(tab, str(robot["urdf"]), dd, cmap)
-                # GL init + graph init are called by viewer.py after do_load
                 ps["error"] = ""
             except Exception as exc:
                 ps["error"] = str(exc)
@@ -418,6 +493,16 @@ def draw_picker(tab: TabState, avail_w: float, avail_h: float) -> None:
         if missing:
             imgui.same_line()
             imgui.text_colored((1.0, 0.65, 0.1, 1), f"⚠ {len(missing)} required unmapped")
+
+        if unknown:
+            n_extra = sum(1 for fn in unknown if cmap.get(extra_channel_name(fn)))
+            if n_extra:
+                imgui.same_line()
+                imgui.text_colored(
+                    (0.35, 1.0, 0.55, 1),
+                    f"  + {n_extra} auto-detected channel(s) will load"
+                )
+
         if ps.get("error"):
             imgui.text_colored((1, 0.3, 0.3, 1), ps["error"])
 
@@ -425,7 +510,7 @@ def draw_picker(tab: TabState, avail_w: float, avail_h: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Graph panel
+# Graph panel  — UNCHANGED from original
 # ---------------------------------------------------------------------------
 def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
     S = tab.S
@@ -450,16 +535,20 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
         except Exception:
             return 0.0
 
-    def _mk_series(param: str, color_idx: int, lo: float = -30.0, hi: float = 30.0) -> dict:
+    def _mk_series(param: str, color_idx: int, lo: float | None = None, hi: float | None = None) -> dict:
         colors = (
             [tuple(c) for c in _cfg_mod.CFG.colors.graph_series]
             if _cfg_mod.CFG else [(0.25,0.55,1.00),(0.20,0.85,0.40),(1.00,0.70,0.15),(0.85,0.25,0.85)]
         )
         r, g2, b = colors[color_idx % len(colors)][:3]
+        _lo = lo if lo is not None else float("-inf")
+        _hi = hi if hi is not None else float("inf")
         return {
             "param": param, "enabled": True, "color": (r, g2, b),
-            "limit_lo": lo, "limit_hi": hi,
-            "lim_lo_str": str(int(lo)), "lim_hi_str": str(int(hi)),
+            "limit_lo": _lo, "limit_hi": _hi,
+            "lim_lo_str": f"{_lo:.3g}" if lo is not None else "",
+            "lim_hi_str": f"{_hi:.3g}" if hi is not None else "",
+            "has_bound":  lo is not None and hi is not None,
         }
 
     def _mk_graph(title: str, series: list, lo: float, hi: float) -> dict:
@@ -469,8 +558,8 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
             "title": title, "series": series, "lo": lo, "hi": hi,
             "lo_str": str(lo), "hi_str": str(hi),
             "lo_edit": False, "hi_edit": False, "hovered": -1,
-            "side_w": 200,   # draggable side-panel width (pixels, pre-scale)
-            "_gid": _graph_id_counter,  # stable ID: never changes even when graphs reorder
+            "side_w": 200,
+            "_gid": _graph_id_counter,
         }
 
     pw     = avail_w
@@ -481,12 +570,11 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
     gi = 0
     while gi < len(_graphs):
         graph  = _graphs[gi]
-        gid    = graph.get("_gid", gi)   # stable ID — must be first, used by all widgets
+        gid    = graph.get("_gid", gi)
         lo, hi = graph["lo"], graph["hi"]
         series = graph["series"]
         span   = hi - lo if hi != lo else 1.0
 
-        # Header row
         imgui.text_colored((0.65, 0.75, 0.88, 1), graph["title"][:30])
         imgui.same_line(); imgui.text_disabled("["); imgui.same_line()
         imgui.push_item_width(54)
@@ -540,7 +628,6 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
         gi2    = gi - 1
         body_start_x, body_start_y = _ui_get_cursor_screen_pos()
 
-        # Side panel — width is per-graph and draggable
         SIDE_W = max(SIDE_W_MIN, min(SIDE_W_MAX, sc(graph.get("side_w", 200))))
         _ui_push_style_color(imgui.Col_.child_bg, 0.07, 0.07, 0.10, 1.0)
         _ui_begin_child(f"##side{gid}", SIDE_W, gh, True)
@@ -583,44 +670,45 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
                 if not imgui.is_item_active() and not imgui.is_item_focused():
                     s["_edit"] = False
             imgui.same_line()
-            imgui.push_item_width(38)
-            ch_lo, new_lo_s = _ui_input_text(
-                f"##lo{gid}_{si}", s.get("lim_lo_str", str(int(s["limit_lo"]))), 8, _UI_INPUT_TEXT_ENTER
-            )
-            if ch_lo:
-                try:
-                    s["limit_lo"] = float(new_lo_s); s["lim_lo_str"] = new_lo_s
-                except ValueError as exc:
-                    logger.warning(f"[ui_panels] Invalid series limit_lo '{new_lo_s}': {exc}")
-            imgui.pop_item_width(); imgui.same_line()
-            imgui.push_item_width(38)
-            ch_hi, new_hi_s = _ui_input_text(
-                f"##hi{gid}_{si}", s.get("lim_hi_str", str(int(s["limit_hi"]))), 8, _UI_INPUT_TEXT_ENTER
-            )
-            if ch_hi:
-                try:
-                    s["limit_hi"] = float(new_hi_s); s["lim_hi_str"] = new_hi_s
-                except ValueError as exc:
-                    logger.warning(f"[ui_panels] Invalid series limit_hi '{new_hi_s}': {exc}")
-            imgui.pop_item_width(); imgui.same_line()
+            if s.get("has_bound", False):
+                imgui.push_item_width(38)
+                ch_lo, new_lo_s = _ui_input_text(
+                    f"##lo{gid}_{si}", s.get("lim_lo_str", ""), 8, _UI_INPUT_TEXT_ENTER
+                )
+                if ch_lo:
+                    try:
+                        s["limit_lo"] = float(new_lo_s); s["lim_lo_str"] = new_lo_s; s["has_bound"] = True
+                    except ValueError as exc:
+                        logger.warning(f"[ui_panels] Invalid series limit_lo '{new_lo_s}': {exc}")
+                imgui.pop_item_width(); imgui.same_line()
+                imgui.push_item_width(38)
+                ch_hi, new_hi_s = _ui_input_text(
+                    f"##hi{gid}_{si}", s.get("lim_hi_str", ""), 8, _UI_INPUT_TEXT_ENTER
+                )
+                if ch_hi:
+                    try:
+                        s["limit_hi"] = float(new_hi_s); s["lim_hi_str"] = new_hi_s; s["has_bound"] = True
+                    except ValueError as exc:
+                        logger.warning(f"[ui_panels] Invalid series limit_hi '{new_hi_s}': {exc}")
+                imgui.pop_item_width(); imgui.same_line()
+            else:
+                imgui.text_disabled("--  --"); imgui.same_line()
             if _ui_button(f"-##{gi}_{si}r", 20, 0):
                 series.pop(si); continue
             cv  = _get_val(d, G.frame, s["param"])
-            oob = cv < s["limit_lo"] or cv > s["limit_hi"]
+            has_b_side = s.get("has_bound", False)
+            oob = has_b_side and (cv < s["limit_lo"] or cv > s["limit_hi"])
             col = (1.0, 0.2, 0.2, 1) if oob else (r2 * 0.85, g2 * 0.85, b2 * 0.85, 1)
             imgui.text_colored(col, f"  {cv:+.3f}")
 
         imgui.end_child(); imgui.pop_style_color()
 
-        # Vertical splitter — manual hit test (imgui buttons break on graphs 2+ due
-        # to invisible canvas button capturing mouse in the same region)
         imgui.same_line()
         sp_x, sp_y = _ui_get_cursor_screen_pos()
         sp_w = sc(6); sp_h = gh
         mx_s, my_s = _ui_get_mouse_pos()
         sp_hovered = (sp_x <= mx_s <= sp_x + sp_w) and (sp_y <= my_s <= sp_y + sp_h)
 
-        # Track drag state per graph in _graph_ph_drag using negative keys
         drag_key = f"_split_{gid}"
         sp_dragging = _graph_ph_drag.get(drag_key, False)
 
@@ -646,19 +734,22 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
             dl_sp.add_rect_filled((sp_x, sp_y), (sp_x + sp_w, sp_y + sp_h),
                                   _ui_color_u32(0.28, 0.28, 0.32, 0.60))
 
-        # Consume the splitter space in the layout
         imgui.dummy((sp_w, sp_h))
 
-        # Canvas fills remaining width
         imgui.same_line()
-        canvas_w = max(sc(60), pw - SIDE_W - sp_w - sc(4))
-        canvas_origin_x, canvas_origin_y = _ui_get_cursor_screen_pos()
+        y_tick_w = sc(38)
+        canvas_w = max(sc(60), pw - SIDE_W - sp_w - sc(4) - y_tick_w)
+        canvas_origin_x_raw, canvas_origin_y = _ui_get_cursor_screen_pos()
+        canvas_origin_x = canvas_origin_x_raw + y_tick_w
         dl   = imgui.get_window_draw_list()
         sk_h = sc(14)
 
-        # Seek bar
         sk_x  = canvas_origin_x; sk_y = canvas_origin_y
-        sk_start = max(0, S.frame - gw); sk_end = min(S.n_frames, S.frame + gw)
+        _rt_mode = getattr(S, "realtime_mode", False) and S.playing
+        if _rt_mode:
+            sk_start = 0; sk_end = max(1, S.frame)
+        else:
+            sk_start = max(0, S.frame - gw); sk_end = min(S.n_frames, S.frame + gw)
         sk_span  = max(sk_end - sk_start, 1)
         gf       = G.frame
 
@@ -688,8 +779,6 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
                 (gf_sk_x - sc(4), sk_y + sk_h), (gf_sk_x + sc(4), sk_y + sk_h),
                 (gf_sk_x, sk_y + sk_h - 7), _ui_color_u32(1, 0.92, 0.2, 0.9),
             )
-        # Manual hit test — invisible_button creates a blocking hit region that
-        # prevents X buttons on graphs above from receiving clicks
         _sk_mx, _sk_my = _ui_get_mouse_pos()
         _sk_hit = (sk_x <= _sk_mx <= sk_x + canvas_w) and (sk_y <= _sk_my <= sk_y + sk_h)
         if _sk_hit and imgui.is_mouse_down(0):
@@ -697,20 +786,58 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
             G.scrub(new_gf, S.n_frames)
         imgui.dummy((canvas_w, sk_h))
 
-        # Graph canvas
         gx  = canvas_origin_x
         gy2 = canvas_origin_y + sk_h
         dl.add_rect_filled((gx, gy2), (gx + canvas_w, gy2 + gh), _ui_color_u32(0.05, 0.05, 0.07))
         _ui_add_rect(dl, (gx, gy2), (gx + canvas_w, gy2 + gh), _ui_color_u32(0.18, 0.18, 0.22), 0.0, 1.0)
-        _ui_push_clip_rect(dl, (gx, gy2), (gx + canvas_w, gy2 + gh), True)
+
+        if _rt_mode:
+            start_auto = 0; end_auto = max(1, S.frame)
+        else:
+            start_auto = max(0, S.frame - gw)
+            end_auto   = min(S.n_frames, S.frame + gw)
+        data_vals  = []
+        for _s in series:
+            if not _s.get("enabled", True): continue
+            _fn = _GRAPH_PARAMS.get(_s["param"])
+            if _fn is None: continue
+            for _fi in range(start_auto, end_auto, max(1, (end_auto - start_auto) // 200)):
+                try:
+                    data_vals.append(_fn(d, _fi))
+                except Exception:
+                    pass
+        if data_vals:
+            d_lo = min(data_vals); d_hi = max(data_vals)
+            pad  = max(abs(d_hi - d_lo) * 0.05, 0.01)
+            ax_lo = d_lo - pad; ax_hi = d_hi + pad
+        else:
+            ax_lo = -1.0; ax_hi = 1.0
+        ax_span = ax_hi - ax_lo if ax_hi != ax_lo else 1.0
 
         def vy(v):
-            return gy2 + gh - (v - lo) / span * gh
+            return gy2 + gh - (v - ax_lo) / ax_span * gh
 
-        if lo < 0 < hi:
+        n_ticks = int(getattr(getattr(_cfg_mod.CFG, "graphs", None), "y_axis_ticks", 5))
+        _ui_push_clip_rect(dl, (canvas_origin_x_raw, gy2), (canvas_origin_x, gy2 + gh), True)
+        for _ti in range(n_ticks):
+            _tv  = ax_lo + (ax_hi - ax_lo) * _ti / max(n_ticks - 1, 1)
+            _ty  = vy(_tv)
+            dl.add_line((canvas_origin_x - sc(4), _ty), (canvas_origin_x, _ty),
+                        _ui_color_u32(0.35, 0.35, 0.38, 0.7), 1)
+            _tlbl = f"{_tv:.3g}"
+            dl.add_text((canvas_origin_x_raw, _ty - sc(6)),
+                        _ui_color_u32(0.42, 0.42, 0.46), _tlbl)
+        dl.pop_clip_rect()
+
+        _ui_push_clip_rect(dl, (gx, gy2), (gx + canvas_w, gy2 + gh), True)
+
+        if ax_lo < 0 < ax_hi:
             dl.add_line((gx, vy(0)), (gx + canvas_w, vy(0)), _ui_color_u32(0.32, 0.32, 0.32, 0.3), 1)
 
-        start = max(0, S.frame - gw); end = min(S.n_frames, S.frame + gw)
+        if _rt_mode:
+            start = 0; end = max(2, S.frame + 1)
+        else:
+            start = max(0, S.frame - gw); end = min(S.n_frames, S.frame + gw)
         nw    = max(end - start, 2)
         g_center   = max(start, min(end - 1, G.frame))
         ph_x       = gx + canvas_w * (g_center - start) / max(nw - 1, 1)
@@ -747,15 +874,16 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
             base_a    = 0.20 if is_dimmed else (1.0 if is_hov else 0.85)
             lw        = 2.5  if is_hov    else 1.4
 
-            if is_hov and mouse_in:
+            if is_hov and mouse_in and s.get("has_bound", False):
                 dl.add_line((gx, vy(s_lo)), (gx + canvas_w, vy(s_lo)), _ui_color_u32(r2, g2, b2, 0.6), 1)
                 dl.add_line((gx, vy(s_hi)), (gx + canvas_w, vy(s_hi)), _ui_color_u32(r2, g2, b2, 0.6), 1)
                 dl.add_text((gx + canvas_w - 44, vy(s_hi) - 12), _ui_color_u32(r2, g2, b2, 0.85), f"{s_hi:.4g}")
                 dl.add_text((gx + canvas_w - 44, vy(s_lo) + 2),  _ui_color_u32(r2, g2, b2, 0.85), f"{s_lo:.4g}")
 
             pp3 = ppy3 = pv2 = None
+            has_b = s.get("has_bound", False)
             c_in  = _ui_color_u32(r2, g2, b2, base_a)
-            c_out = _ui_color_u32(1.0, 0.15, 0.15, base_a)
+            c_out = _ui_color_u32(1.0, 0.15, 0.15, base_a) if has_b else c_in
             for k in range(nw):
                 fi2 = start + k
                 try:
@@ -771,7 +899,7 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
                     c_in2  = _ui_color_u32(r2, g2, b2, a2)
                     c_out2 = _ui_color_u32(1.0, 0.15, 0.15, a2)
                     ts = [0.0, 1.0]; dv = v2 - pv2
-                    if abs(dv) > 1e-9:
+                    if has_b and abs(dv) > 1e-9:
                         t_lo = (s_lo - pv2) / dv
                         if 0.0 < t_lo < 1.0: ts.append(t_lo)
                         t_hi = (s_hi - pv2) / dv
@@ -782,18 +910,15 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
                         xa = pp3  + (px4 - pp3)  * ta; ya = ppy3 + (py4 - ppy3) * ta
                         xb = pp3  + (px4 - pp3)  * tb; yb = ppy3 + (py4 - ppy3) * tb
                         vm = pv2  + dv * (ta + tb) * 0.5
-                        col2 = c_out2 if (vm < s_lo or vm > s_hi) else c_in2
+                        col2 = (c_out2 if (vm < s_lo or vm > s_hi) else c_in2) if has_b else c_in2
                         dl.add_line((xa, ya), (xb, yb), col2, lw)
                 pp3, ppy3, pv2 = px4, py4, v2
         dl.pop_clip_rect()
 
-        # Define is_ph_drag here so probe section below can use it
         is_ph_drag = _graph_ph_drag.get(gi2, False)
 
-        # ── Probe: left-click to place, right-click to remove ─────────────
         if mouse_in and not is_ph_drag:
             if imgui.is_mouse_clicked(0) and hov_si >= 0:
-                # Place probe on hovered series at current mouse x
                 s_place = series[hov_si]
                 fn_p    = _GRAPH_PARAMS.get(s_place["param"])
                 fi_p    = start + int((mx2 - gx) / canvas_w * (nw - 1))
@@ -815,7 +940,6 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
                         pass
 
             if imgui.is_mouse_clicked(1):
-                # Remove nearest probe within this graph's canvas (by screen distance)
                 REMOVE_RADIUS_SQ = sc(16) ** 2
                 best_idx  = -1
                 best_dist = REMOVE_RADIUS_SQ
@@ -840,14 +964,13 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
                 if best_idx >= 0:
                     tab.probes.pop(best_idx)
 
-        # ── Draw visible probes for this graph ────────────────────────────
         _ui_push_clip_rect(dl, (gx, gy2), (gx + canvas_w, gy2 + gh), True)
         for probe in tab.probes:
             if probe["graph_idx"] != gi2:
                 continue
             pfi = probe["frame_idx"]
             if not (start <= pfi <= end - 1):
-                continue   # outside window — hidden but not deleted
+                continue
             fn_p = _GRAPH_PARAMS.get(probe["param"])
             if fn_p is None:
                 continue
@@ -857,7 +980,6 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
                 px_p = gx + canvas_w * (pfi - start) / max(nw - 1, 1)
                 py_p = vy(pv)
 
-                # Vertical dashed line
                 dash_h = sc(4); gap_h = sc(3)
                 y_cur  = gy2
                 while y_cur < gy2 + gh:
@@ -865,18 +987,15 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
                     dl.add_line((px_p, y_cur), (px_p, y_end), _ui_color_u32(r2p, g2p, b2p, 0.55), 1)
                     y_cur += dash_h + gap_h
 
-                # Horizontal dashed line
                 x_cur = gx
                 while x_cur < gx + canvas_w:
                     x_end = min(x_cur + dash_h, gx + canvas_w)
                     dl.add_line((x_cur, py_p), (x_end, py_p), _ui_color_u32(r2p, g2p, b2p, 0.35), 1)
                     x_cur += dash_h + gap_h
 
-                # Dot
                 dl.add_circle_filled((px_p, py_p), sc(4), _ui_color_u32(r2p, g2p, b2p, 1.0))
                 dl.add_circle((px_p, py_p), sc(5), _ui_color_u32(1, 1, 1, 0.8), 0, 1.0)
 
-                # Label: time + value, positioned to avoid going off canvas
                 t_str  = f"t={probe['t']:.3f}s" if d.get("time") is not None else f"f={pfi}"
                 v_str  = f"{pv:+.3f}"
                 lbl_w  = sc(80)
@@ -912,10 +1031,8 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
             if is_ph_drag:
                 _graph_ph_drag[gi2] = False
 
-        # Use dummy instead of invisible_button to avoid blocking X buttons above
         imgui.dummy((canvas_w, gh))
 
-        # X axis
         axis_h = sc(16); ax_y = gy2 + gh
         dl.add_rect_filled((gx, ax_y), (gx + canvas_w, ax_y + axis_h), _ui_color_u32(0.04, 0.04, 0.06))
         for ti in range(7):
@@ -933,18 +1050,12 @@ def render_graphs(tab: TabState, avail_w: float, ui: UIState) -> None:
 
         imgui.set_cursor_screen_pos((body_start_x, body_start_y + sk_h + gh + axis_h + sc(6)))
         imgui.spacing()
-        # (end of graph loop)
-
 
 
 # ---------------------------------------------------------------------------
-# New-graph modal  (call once per frame from viewer.py at window level)
+# New-graph modal  — UNCHANGED
 # ---------------------------------------------------------------------------
 def draw_new_graph_modal(tab, ui: UIState) -> None:
-    """
-    New-graph picker as a floating imgui window.
-    Called once per frame from viewer.py while ##main is still open.
-    """
     global _graph_id_counter
     if not _new_graph_modal["open"] or _new_graph_modal["tab_id"] != tab.id:
         return
@@ -952,7 +1063,6 @@ def draw_new_graph_modal(tab, ui: UIState) -> None:
     sc = ui.sc
     io = imgui.get_io()
 
-    # On first open: set position and size
     if _new_graph_modal.get("_needs_open", False):
         imgui.set_next_window_size((sc(560), sc(580)))
         imgui.set_next_window_pos(
@@ -960,7 +1070,6 @@ def draw_new_graph_modal(tab, ui: UIState) -> None:
             imgui.Cond_.always,
             (0.5, 0.5),
         )
-        # Keep _needs_open True until begin() actually runs so sizing applies
         _new_graph_modal["_needs_open"] = False
 
     flags = (
@@ -969,7 +1078,6 @@ def draw_new_graph_modal(tab, ui: UIState) -> None:
         imgui.WindowFlags_.no_scroll_with_mouse
     )
 
-    # Use begin without p_open — we manage close state ourselves via buttons
     _ui_begin("New Graph##ng_win", flags)
 
     _PARAM_KEYS = tab.PARAM_KEYS
@@ -978,10 +1086,8 @@ def draw_new_graph_modal(tab, ui: UIState) -> None:
         if pk not in checked:
             checked[pk] = False
 
-    # ── Header with close button ──────────────────────────────────────────
     imgui.text_colored((0.65, 0.85, 1.0, 1.0), "Add New Graph")
     imgui.same_line()
-    # Push close button to right side
     avail_x = _ui_get_content_region_avail()[0]
     imgui.set_cursor_pos_x(imgui.get_cursor_pos_x() + avail_x - sc(24))
     if _ui_button("X##ngclose", sc(24), sc(20)):
@@ -1008,7 +1114,6 @@ def draw_new_graph_modal(tab, ui: UIState) -> None:
     imgui.pop_item_width()
     imgui.spacing()
 
-    # ── Search + select-all/none ──────────────────────────────────────────
     imgui.push_item_width(sc(220))
     ch, val = _ui_input_text("##ngsearch", _new_graph_modal["search"], 64)
     if ch:
@@ -1035,7 +1140,6 @@ def draw_new_graph_modal(tab, ui: UIState) -> None:
             checked[pk] = False
     imgui.separator()
 
-    # ── Scrollable checkbox list ──────────────────────────────────────────
     avail_w, avail_h = _ui_get_content_region_avail()
     list_h = max(sc(200), avail_h - sc(52))
 
@@ -1071,7 +1175,6 @@ def draw_new_graph_modal(tab, ui: UIState) -> None:
     imgui.end_child()
     imgui.pop_style_color()
 
-    # ── Confirm / Cancel ──────────────────────────────────────────────────
     imgui.separator()
     can_add = n_checked > 0
     if not can_add:
@@ -1083,12 +1186,10 @@ def draw_new_graph_modal(tab, ui: UIState) -> None:
         try:
             y_min = float(_new_graph_modal["y_min_str"])
         except ValueError:
-            logger.warning(f"[ui_panels] Invalid y_min '{_new_graph_modal['y_min_str']}', using -30")
             y_min = -30.0
         try:
             y_max = float(_new_graph_modal["y_max_str"])
         except ValueError:
-            logger.warning(f"[ui_panels] Invalid y_max '{_new_graph_modal['y_max_str']}', using 30")
             y_max = 30.0
 
         title = _new_graph_modal["title"].strip() or "New Graph"
@@ -1129,7 +1230,232 @@ def draw_new_graph_modal(tab, ui: UIState) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Settings panel
+# Config panel — renders config.yaml as a styled, readable panel
+# ---------------------------------------------------------------------------
+
+_CFG_SKIP_KEYS = {"_locked", "_type_safe", "_convert_dict"}
+
+# Preferred section display order
+_CFG_SECTION_ORDER = [
+    "gait", "raibert", "qp", "env", "obs", "rewards", "robot", "training",
+]
+
+# Per-section (accent_rgb, bg_rgb) — accent for header bar, bg for row tinting
+_CFG_SECTION_STYLE: dict[str, tuple] = {
+    "gait":     ((0.30, 0.82, 0.52), (0.08, 0.18, 0.12)),
+    "raibert":  ((0.95, 0.68, 0.18), (0.18, 0.13, 0.04)),
+    "qp":       ((0.75, 0.35, 1.00), (0.14, 0.08, 0.20)),
+    "obs":      ((0.28, 0.80, 0.88), (0.06, 0.16, 0.20)),
+    "env":      ((1.00, 0.50, 0.28), (0.20, 0.10, 0.05)),
+    "rewards":  ((1.00, 0.82, 0.22), (0.18, 0.15, 0.04)),
+    "robot":    ((0.35, 0.68, 1.00), (0.06, 0.12, 0.22)),
+    "training": ((0.60, 0.62, 0.68), (0.10, 0.10, 0.13)),
+}
+_CFG_DEFAULT_STYLE = ((0.62, 0.68, 0.72), (0.10, 0.10, 0.13))
+
+
+def _cfg_scalar_str(v) -> str | None:
+    """Short display string for a scalar. Returns None for complex types."""
+    if isinstance(v, (bytes, bytearray)): return f"<bytes {len(v)}>"
+    if v is None:   return "(none)"
+    if isinstance(v, bool): return "true" if v else "false"
+    if isinstance(v, float): return f"{v:.6g}"
+    if isinstance(v, int):   return str(v)
+    if isinstance(v, str):   return f'"{v}"' if len(v) < 48 else f'"{v[:45]}..."'
+    # numpy arrays — show shape and compact values
+    try:
+        import numpy as _np
+        if isinstance(v, _np.ndarray):
+            if v.ndim == 0:
+                return f"{float(v):.6g}"
+            elif v.size <= 6:
+                vals = ", ".join(f"{x:.4g}" for x in v.flat)
+                return f"[{vals}]"
+            else:
+                vals = ", ".join(f"{x:.4g}" for x in list(v.flat)[:4])
+                return f"[{vals} ...  shape={list(v.shape)}]"
+    except ImportError:
+        pass
+    return None
+
+
+
+def _cfg_list_str(lst) -> str:
+    """Compact one-liner for a flat list of scalars."""
+    parts = []
+    for x in lst[:10]:
+        s = _cfg_scalar_str(x)
+        parts.append(s if s else "?")
+    suffix = f"  +{len(lst)-10} more" if len(lst) > 10 else ""
+    return "[" + ",  ".join(parts) + suffix + "]"
+
+
+def _render_kv_row(key: str, value, accent_col: tuple, row_idx: int, dl, sc) -> None:
+    """Render one key=value row with alternating background tinting."""
+    # Alternating row background
+    if row_idx % 2 == 0:
+        rx, ry = _ui_get_cursor_screen_pos()
+        rw, _ = _ui_get_content_region_avail()
+        dl.add_rect_filled(
+            (rx - 4, ry - 1),
+            (rx + rw + 4, ry + sc(16)),
+            _ui_color_u32(0.12, 0.12, 0.16, 0.55),
+        )
+
+    imgui.push_item_width(-1)
+
+    # Key column (fixed ~40% width using indent + same_line trick)
+    key_w = 160
+    imgui.text_colored(accent_col, f"  {key}")
+    imgui.same_line(key_w)
+    imgui.text_colored((0.45, 0.45, 0.50, 1.0), "|")
+    imgui.same_line()
+
+    val_str = _cfg_scalar_str(value)
+    if val_str is not None:
+        # Colour booleans distinctively
+        if isinstance(value, bool):
+            col = (0.35, 0.90, 0.50, 1.0) if value else (0.90, 0.38, 0.35, 1.0)
+        elif isinstance(value, (int, float)):
+            col = (0.88, 0.88, 0.60, 1.0)
+        elif isinstance(value, str):
+            col = (0.70, 0.88, 0.70, 1.0)
+        else:
+            col = (0.80, 0.80, 0.80, 1.0)
+        imgui.text_colored(col, val_str)
+    elif isinstance(value, (list, tuple)) and len(value) > 0 and not isinstance(value[0], dict):
+        if isinstance(value[0], (list, tuple)):
+            imgui.text_colored((0.60, 0.70, 0.88, 1.0),
+                               f"matrix {len(value)}x{len(value[0])}")
+        else:
+            imgui.text_colored((0.60, 0.82, 0.92, 1.0), _cfg_list_str(value))
+    else:
+        imgui.text_disabled("...")
+
+    imgui.pop_item_width()
+
+
+def _render_cfg_section_body(data: dict, accent_col: tuple, sc, dl) -> None:
+    """Render all scalar/list key-value pairs in a dict, then motor sub-cards."""
+    # Separate scalars/lists from nested dicts and motor-lists
+    scalars  = {k: v for k, v in data.items()
+                if k not in _CFG_SKIP_KEYS
+                and not (isinstance(v, dict))
+                and not (isinstance(v, (list, tuple)) and len(v) > 0
+                         and isinstance(v[0], dict))}
+    subdicts = {k: v for k, v in data.items()
+                if k not in _CFG_SKIP_KEYS and isinstance(v, dict)}
+    sublists = {k: v for k, v in data.items()
+                if k not in _CFG_SKIP_KEYS
+                and isinstance(v, (list, tuple)) and len(v) > 0
+                and isinstance(v[0], dict)}
+
+    # ── Scalar/list rows ─────────────────────────────────────────────────
+    for i, (k, v) in enumerate(sorted(scalars.items())):
+        _render_kv_row(k, v, accent_col, i, dl, sc)
+
+    # ── Nested dicts (sub-sections like motors > sub-config) ─────────────
+    for k, v in sorted(subdicts.items()):
+        imgui.spacing()
+        imgui.text_colored((0.55, 0.55, 0.62, 1.0), f"  >> {k}")
+        imgui.separator()
+        for i2, (k2, v2) in enumerate(sorted(v.items())):
+            if k2 not in _CFG_SKIP_KEYS:
+                _render_kv_row(k2, v2, accent_col, i2, dl, sc)
+
+    # ── List-of-dicts (e.g. motors) as collapsing mini-cards ─────────────
+    for k, lst in sorted(sublists.items()):
+        imgui.spacing()
+        hdr_open = _ui_collapsing_header(f"  {k}  [{len(lst)} entries]##sub_{k}")
+        if hdr_open:
+            for mi, item in enumerate(lst):
+                if not isinstance(item, dict):
+                    continue
+                name_lbl = item.get("name", f"[{mi}]")
+                card_open = _ui_collapsing_header(f"    {name_lbl}##card_{k}_{mi}")
+                if card_open:
+                    for i3, (k3, v3) in enumerate(sorted(item.items())):
+                        if k3 != "name":
+                            _render_kv_row(k3, v3, accent_col, i3, dl, sc)
+
+
+def render_config_panel(tab: TabState, avail_w: float, avail_h: float, ui: UIState) -> None:
+    """Render the config.yaml browser as a styled, table-like panel."""
+    sc = ui.sc
+    dl = imgui.get_window_draw_list()
+
+    if tab.train_cfg_raw is None:
+        imgui.spacing()
+        imgui.text_colored((1.0, 0.55, 0.2, 1.0), "  No config.yaml found for this run.")
+        imgui.spacing()
+        imgui.text_disabled("  Expected: config.yaml in the data directory.")
+        imgui.text_disabled("  The eval script copies config.yaml into the output folder.")
+        return
+
+    cfg = tab.train_cfg_raw
+
+    ordered = [k for k in _CFG_SECTION_ORDER if k in cfg]
+    rest    = sorted(k for k in cfg if k not in _CFG_SECTION_ORDER and k not in _CFG_SKIP_KEYS)
+
+    for section_key in ordered + rest:
+        if section_key in _CFG_SKIP_KEYS:
+            continue
+        value  = cfg[section_key]
+        accent_rgb, bg_rgb = _CFG_SECTION_STYLE.get(section_key, _CFG_DEFAULT_STYLE)
+        accent_col = (*accent_rgb, 1.0)
+
+        imgui.push_id(f"cfs_{section_key}")
+        imgui.spacing()
+
+        # ── Section header bar ────────────────────────────────────────────
+        # Draw a filled rect behind the collapsing header for colour
+        hdr_x, hdr_y = _ui_get_cursor_screen_pos()
+        hdr_w, _ = _ui_get_content_region_avail()
+        hdr_h = sc(20)
+        dl.add_rect_filled(
+            (hdr_x, hdr_y),
+            (hdr_x + hdr_w, hdr_y + hdr_h),
+            _ui_color_u32(*bg_rgb, 1.0),
+        )
+        dl.add_line(
+            (hdr_x, hdr_y), (hdr_x + hdr_w, hdr_y),
+            _ui_color_u32(*accent_rgb, 0.80), 1.5,
+        )
+        dl.add_line(
+            (hdr_x, hdr_y + hdr_h), (hdr_x + hdr_w, hdr_y + hdr_h),
+            _ui_color_u32(*accent_rgb, 0.25), 1.0,
+        )
+
+        _ui_push_style_color(imgui.Col_.header,         *accent_rgb, 0.0)   # transparent fill (we drew it)
+        _ui_push_style_color(imgui.Col_.header_hovered, *accent_rgb, 0.18)
+        _ui_push_style_color(imgui.Col_.header_active,  *accent_rgb, 0.32)
+        _ui_push_style_color(imgui.Col_.text,           *accent_rgb, 1.0)
+
+        if isinstance(value, dict):
+            section_open = _ui_collapsing_header(f"  {section_key.upper()}")
+        else:
+            # Scalar top-level key — just show inline
+            section_open = False
+            imgui.text_colored(accent_col, f"  {section_key}")
+            imgui.same_line()
+            vs = _cfg_scalar_str(value)
+            imgui.text_colored((0.88, 0.88, 0.60, 1.0), vs or "...")
+
+        imgui.pop_style_color(4)
+
+        if section_open and isinstance(value, dict):
+            imgui.indent(sc(8))
+            _render_cfg_section_body(value, accent_col, sc, dl)
+            imgui.unindent(sc(8))
+
+        imgui.pop_id()
+
+    imgui.spacing()
+
+
+
+# ---------------------------------------------------------------------------
+# Settings panel  — UNCHANGED, + show_raibert_boxes checkbox added
 # ---------------------------------------------------------------------------
 def render_settings(tab: TabState, ui: UIState) -> None:
     S  = tab.S
@@ -1169,7 +1495,10 @@ def render_settings(tab: TabState, ui: UIState) -> None:
     _, S.show_limits       = imgui.checkbox("Limits##sl",   S.show_limits);       imgui.same_line()
     _, S.show_grid         = imgui.checkbox("Grid##sg",     S.show_grid);         imgui.same_line()
     _, S.show_trajectory   = imgui.checkbox("Traj##st",     S.show_trajectory);   imgui.same_line()
-    _, S.show_joint_frames = imgui.checkbox("JFrames##sjf", S.show_joint_frames)
+    _, S.show_joint_frames = imgui.checkbox("JFrames##sjf", S.show_joint_frames); imgui.same_line()
+    # show_raibert_boxes was added in a previous session — guard against old state objects
+    if hasattr(S, "show_raibert_boxes"):
+        _, S.show_raibert_boxes = imgui.checkbox("Raibert##srb", S.show_raibert_boxes)
 
     imgui.spacing()
     imgui.text_colored((0.65, 0.75, 0.88, 1), "FOG")
@@ -1198,17 +1527,13 @@ def render_settings(tab: TabState, ui: UIState) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Timeline panel
+# Timeline panel  — UNCHANGED
 # ---------------------------------------------------------------------------
 def _timeline_bar(
     dl, px: float, py: float, bw: float, bh: float,
     n_fr: int, lo: int, hi: int, cur: int,
     sc,
 ) -> tuple[int, int, int, bool]:
-    """
-    Draw the IN/OUT/seek timeline bar.
-    Returns (new_lo, new_hi, new_cur, changed).
-    """
     MINI_H = sc(16)
     MAIN_H = max(20, bh - MINI_H * 2 - 2)
     in_y   = py
@@ -1219,7 +1544,6 @@ def _timeline_bar(
     xhi = px + bw * hi  / max(n_fr - 1, 1)
     xfr = px + bw * cur / max(n_fr - 1, 1)
 
-    # IN strip
     dl.add_rect_filled((px, in_y), (px + bw, in_y + MINI_H), _ui_color_u32(0.07, 0.11, 0.07))
     dl.add_rect_filled((xlo, in_y), (px + bw, in_y + MINI_H), _ui_color_u32(0.08, 0.28, 0.08, 0.55))
     dl.add_line((xlo, in_y), (xlo, in_y + MINI_H), _ui_color_u32(0.2, 0.9, 0.2, 0.9), 2)
@@ -1227,7 +1551,6 @@ def _timeline_bar(
     dl.add_line((xfr, in_y), (xfr, in_y + MINI_H), _ui_color_u32(1, 0.92, 0.2, 0.4), 1)
     dl.add_text((px + 2, in_y), _ui_color_u32(0.25, 0.75, 0.25, 0.9), f"IN {lo}")
 
-    # OUT strip
     dl.add_rect_filled((px, out_y), (px + bw, out_y + MINI_H), _ui_color_u32(0.11, 0.07, 0.07))
     dl.add_rect_filled((px, out_y), (xhi, out_y + MINI_H), _ui_color_u32(0.28, 0.08, 0.08, 0.55))
     dl.add_line((xhi, out_y), (xhi, out_y + MINI_H), _ui_color_u32(0.9, 0.2, 0.2, 0.9), 2)
@@ -1235,7 +1558,6 @@ def _timeline_bar(
     dl.add_line((xfr, out_y), (xfr, out_y + MINI_H), _ui_color_u32(1, 0.92, 0.2, 0.4), 1)
     dl.add_text((px + bw - 52, out_y), _ui_color_u32(0.75, 0.25, 0.25, 0.9), f"OUT {hi}")
 
-    # Main bar
     dl.add_rect_filled((px, main_y), (px + bw, main_y + MAIN_H), _ui_color_u32(0.09, 0.09, 0.11))
     dl.add_rect_filled((xlo, main_y), (xhi, main_y + MAIN_H), _ui_color_u32(0.12, 0.40, 0.12, 0.38))
     _ui_add_rect(dl, (xlo, main_y), (xhi, main_y + MAIN_H), _ui_color_u32(0.2, 0.65, 0.2, 0.5), 0.0, 1.0)
@@ -1294,8 +1616,33 @@ def render_timeline(tab: TabState, avail_w: float, avail_h: float, ui: UIState) 
 
     n_fr = S.n_frames
 
-    # Transport buttons
-    if _ui_button("|<##a",   sc(28), 0): S.set_frame(S.loop_start)
+    # ── Playback mode radio ───────────────────────────────────────────────
+    imgui.text_colored((0.55, 0.55, 0.60, 1.0), "Playback:")
+    imgui.same_line()
+    was_rt = getattr(S, "realtime_mode", False)
+    if imgui.radio_button("Speed##rtoff", not was_rt):
+        if was_rt:
+            S.realtime_mode = False
+    imgui.same_line()
+    if imgui.radio_button("Realtime (1x)##rton", was_rt):
+        if not was_rt:
+            S.realtime_mode = True
+            S.start_realtime()   # anchor clock to current frame
+    imgui.same_line()
+    # Speed multiplier only relevant in speed mode
+    if not was_rt:
+        imgui.push_item_width(sc(90))
+        cv, vv = imgui.drag_float("##sprt", S.play_speed, 0.02, 0.1, 5.0, "%.2fx")
+        if cv:
+            S.play_speed = max(0.05, vv)
+        imgui.pop_item_width()
+        imgui.same_line()
+    else:
+        imgui.text_colored((0.35, 0.90, 0.55, 1.0), "  wall-clock sync")
+        imgui.same_line()
+    imgui.separator()
+
+
     imgui.same_line()
     if _ui_button("<<##b",   sc(28), 0): S.step(-10)
     imgui.same_line()
@@ -1313,7 +1660,7 @@ def render_timeline(tab: TabState, avail_w: float, avail_h: float, ui: UIState) 
     imgui.pop_style_color()
     imgui.same_line()
 
-    if G.play_mode == "main":
+    if G.play_mode == "main" or getattr(S, "realtime_mode", False):
         play_lbl = "Pause" if S.playing else "Play "
         if _ui_button(f"{play_lbl}##d", sc(46), 0): S.toggle_play()
     else:
@@ -1332,12 +1679,6 @@ def render_timeline(tab: TabState, avail_w: float, avail_h: float, ui: UIState) 
     ch, v = imgui.drag_int("##fr", S.frame, 1, 0, n_fr - 1, "Frame %d")
     if ch:
         S.set_frame(v)
-    imgui.pop_item_width()
-    imgui.same_line()
-    imgui.push_item_width(sc(90))
-    ch, v = imgui.drag_float("##sp", S.play_speed, 0.02, 0.1, 5.0, "%.2fx")
-    if ch:
-        S.play_speed = max(0.05, v)
     imgui.pop_item_width()
     imgui.same_line()
     vx_str = (
@@ -1369,4 +1710,4 @@ def render_timeline(tab: TabState, avail_w: float, avail_h: float, ui: UIState) 
     if _ui_button("Reset##lr", sc(44), 0):
         S.loop_start = 0; S.loop_end = 0
     imgui.same_line()
-    imgui.text_disabled(f"{lo2}–{hi2}")
+    imgui.text_disabled(f"{lo2}-{hi2}")

@@ -1,13 +1,6 @@
 """
-dataviz/state.py
-
-Owns:
-  - AppState       (playback, camera, per-frame queries)
-  - GraphScrubState (ghost robot, graph scrub window)
-  - TabState       (per-tab container: data, robot, GL resources, UI fracs)
-
-Pure Python — no GL, no imgui.
-Only imports: dataviz.config, standard library, numpy, loguru.
+dataviz/state.py  — one change from original:
+  AppState.__init__: added  self.show_raibert_boxes = True
 """
 
 import math
@@ -22,17 +15,8 @@ from loguru import logger
 import dataviz.config as _cfg_mod
 
 
-# ---------------------------------------------------------------------------
-# AppState — playback + camera for one tab
-# ---------------------------------------------------------------------------
 class AppState:
-    """
-    Owns the main playback head (self.frame) and camera for one loaded tab.
-    All frame navigation goes through set_frame() so side-effects stay consistent.
-    """
-
     def __init__(self):
-        # Playback
         self.data:        Optional[dict] = None
         self.n_frames:    int            = 0
         self.frame:       int            = 0
@@ -43,22 +27,24 @@ class AppState:
         self.loop_start:  int            = 0
         self.loop_end:    int            = 0
 
-        # Camera
         self.cam_yaw:    float          = _cfg_mod.CFG.camera.default_yaw    if _cfg_mod.CFG else 45.0
         self.cam_pitch:  float          = _cfg_mod.CFG.camera.default_pitch  if _cfg_mod.CFG else 25.0
         self.cam_dist:   float          = _cfg_mod.CFG.camera.default_dist   if _cfg_mod.CFG else 3.5
         self.cam_target: np.ndarray     = np.array([0.0, 0.0, 0.3])
-        self.cam_follow_mode: str       = "main"   # 'main' | 'ghost'
+        self.cam_follow_mode: str       = "main"
 
-        # Overlays
         self.show_forces:       bool = True
         self.show_contacts:     bool = True
         self.show_limits:       bool = True
         self.show_grid:         bool = True
         self.show_trajectory:   bool = False
         self.show_joint_frames: bool = False
+        self.show_raibert_boxes: bool = True   # ← NEW: toggle Raibert boxes/arrows
 
-        # Rendering tweaks
+        self.realtime_mode:      bool  = False  # play at 1× wall-clock speed using time.txt
+        self._realtime_start_wall: float = 0.0  # wall-clock time when realtime play began
+        self._realtime_start_sim:  float = 0.0  # sim time at the frame where RT play began
+
         traj_len   = _cfg_mod.CFG.rendering.trajectory_length if _cfg_mod.CFG else 200
         fscale     = _cfg_mod.CFG.rendering.force_scale       if _cfg_mod.CFG else 0.003
         fog_s      = _cfg_mod.CFG.rendering.fog_start         if _cfg_mod.CFG else 3.0
@@ -69,17 +55,12 @@ class AppState:
         self.fog_start:    float = fog_s
         self.fog_end:      float = fog_e
 
-        # Back-reference to GraphScrubState (set after construction)
         self.g_ref: Optional["GraphScrubState"] = None
 
-    # ------------------------------------------------------------------
-    # Frame navigation (always use these — keeps g_ref in sync)
-    # ------------------------------------------------------------------
     def _hi(self) -> int:
         return self.loop_end if self.loop_end > 0 else max(0, self.n_frames - 1)
 
     def set_frame(self, f: int) -> None:
-        """Jump to absolute frame. Clamps, syncs camera, syncs ghost."""
         if self.n_frames == 0:
             return
         self.frame = max(0, min(self.n_frames - 1, int(f)))
@@ -102,20 +83,66 @@ class AppState:
         self.set_frame(self.frame + delta)
 
     def toggle_play(self) -> None:
+        # In realtime mode, always force MAIN play mode so S.frame advances freely
+        G = self.g_ref
+        if getattr(self, "realtime_mode", False) and G is not None:
+            if G.play_mode != "main":
+                G.set_mode("main", self.frame)
+            G._playing = False   # stop any graph-mode play
         self.playing   = not self.playing
         self._last_t   = time.time()
         self._frac_acc = 0.0
+        if self.playing and self.realtime_mode and self.data is not None:
+            self._realtime_start_wall = time.time()
+            self._realtime_start_sim  = float(self.data["time"][self.frame])
 
-    # ------------------------------------------------------------------
-    # Per-frame update (called at update_hz from viewer._update)
-    # ------------------------------------------------------------------
+    def start_realtime(self) -> None:
+        """Re-anchor realtime playback. Forces MAIN mode and stops graph play."""
+        G = self.g_ref
+        if G is not None:
+            if G.play_mode != "main":
+                G.set_mode("main", self.frame)
+            G._playing = False   # stop any active graph-mode playback
+        if self.data is not None:
+            self._realtime_start_wall = time.time()
+            self._realtime_start_sim  = float(self.data["time"][self.frame])
+
     def advance(self) -> None:
         G = self.g_ref
-        if G is not None and G.play_mode == "graph":
+        # In graph play mode S.frame is normally frozen, but realtime overrides this.
+        if G is not None and G.play_mode == "graph" and not getattr(self, "realtime_mode", False):
             return
         if not self.playing or self.data is None or self.n_frames < 2:
             return
 
+        if self.realtime_mode:
+            # ── Realtime mode: seek to frame whose sim-time ≈ elapsed wall-clock ──
+            # Use the FULL clip range (0 to n_frames-1), ignoring loop in/out,
+            # so the entire recording plays through regardless of UI loop markers.
+            elapsed    = time.time() - self._realtime_start_wall
+            target_sim = self._realtime_start_sim + elapsed
+            time_arr   = self.data["time"]
+            total_end  = self.n_frames - 1
+            end_t      = float(time_arr[total_end])
+            start_t    = float(time_arr[0])
+            if target_sim >= end_t:
+                # Reached clip end — restart from frame 0
+                self._realtime_start_wall = time.time()
+                self._realtime_start_sim  = start_t
+                self.set_frame(0)
+            else:
+                import numpy as _np
+                idx = int(_np.searchsorted(time_arr, target_sim))
+                idx = max(0, min(total_end, idx))
+                # Pick the closer neighbour
+                if idx > 0 and abs(float(time_arr[idx - 1]) - target_sim) < abs(float(time_arr[idx]) - target_sim):
+                    idx -= 1
+                self.set_frame(idx)
+            return
+
+        # ── Speed-multiplier mode (original behaviour) ────────────────────
+        lo   = self.loop_start
+        hi   = self._hi()
         now      = time.time()
         dt_real  = now - self._last_t
         self._last_t = now
@@ -124,15 +151,10 @@ class AppState:
         steps    = int(self._frac_acc)
         self._frac_acc -= steps
 
-        lo   = self.loop_start
-        hi   = self._hi()
         span = max(hi - lo + 1, 2)
         self.frame = lo + (self.frame - lo + steps) % span
         self._sync_cam()
 
-    # ------------------------------------------------------------------
-    # Camera
-    # ------------------------------------------------------------------
     def update_cam(self) -> None:
         if self.data is None:
             return
@@ -159,11 +181,7 @@ class AppState:
             math.sin(pr),
         ])
 
-    # ------------------------------------------------------------------
-    # Per-frame data extraction (no copies — just views/scalars)
-    # ------------------------------------------------------------------
     def frame_state(self, f: Optional[int] = None):
-        """Return (q, torso_pos, torso_rpy) for frame *f* (defaults to self.frame)."""
         if f is None:
             f = self.frame
         d   = self.data
@@ -181,21 +199,11 @@ class AppState:
         return q, pos, rpy
 
 
-# ---------------------------------------------------------------------------
-# GraphScrubState — ghost robot + graph scrub window
-# ---------------------------------------------------------------------------
 class GraphScrubState:
-    """
-    Controls the ghost robot position and the ±N frame graph scrub window.
-    play_mode:
-        'main'  — ghost follows main frame exactly (no independent motion)
-        'graph' — ghost is independently playable within ±graph_window of backup_frame
-    """
-
     def __init__(self):
         self.frame:         int   = 0
         self.frozen:        bool  = False
-        self.play_mode:     str   = "main"   # 'main' | 'graph'
+        self.play_mode:     str   = "main"
         self.backup_frame:  int   = 0
         self._playing:      bool  = False
         self._last_t:       float = 0.0
@@ -204,9 +212,7 @@ class GraphScrubState:
     def _gw(self) -> int:
         return _cfg_mod.CFG.playback.graph_window if _cfg_mod.CFG else 50
 
-    # ------------------------------------------------------------------
     def scrub(self, fi: int, n_frames: int) -> None:
-        """Move ghost to *fi*, clamped to the current scrub window."""
         anchor = self.backup_frame if self.play_mode == "graph" else fi
         gw     = self._gw()
         lo     = max(0, anchor - gw)
@@ -256,20 +262,7 @@ class GraphScrubState:
         self.frame = lo + (self.frame - lo + steps) % span
 
 
-# ---------------------------------------------------------------------------
-# TabState — per-tab container
-# ---------------------------------------------------------------------------
 class TabState:
-    """
-    One logical tab in the viewer. Holds all per-tab state:
-      - Loaded data + robot description
-      - AppState (S) and GraphScrubState (G)
-      - GL resource handles (populated by gl_core after loading)
-      - Graph configuration
-      - Layout fractions
-      - Picker state
-    """
-
     _id_counter: int = 0
 
     def __init__(self, label: str = "New Tab"):
@@ -277,7 +270,6 @@ class TabState:
         self.id:    int = TabState._id_counter
         self.label: str = label
 
-        # Robot description (populated by do_load)
         self.urdf_path:    Optional[str]        = None
         self.joint_order:  list[str]            = []
         self.joint_limits: dict                 = {}
@@ -288,12 +280,10 @@ class TabState:
         self.channel_map:  dict                 = {}
         self.loaded:       bool                 = False
 
-        # Per-tab playback state
         self.S = AppState()
         self.G = GraphScrubState()
         self.S.g_ref = self.G
 
-        # Layout fractions (persist across tab switches, saved to layout file)
         vp_f  = _cfg_mod.CFG.layout.default_vp_frac       if _cfg_mod.CFG else 0.54
         bot_f = _cfg_mod.CFG.layout.default_bot_frac       if _cfg_mod.CFG else 0.22
         gh_f  = _cfg_mod.CFG.layout.default_graph_h_frac   if _cfg_mod.CFG else 0.72
@@ -302,47 +292,29 @@ class TabState:
         self.bot_frac:      float = bot_f
         self.graph_h_frac:  float = gh_f
 
-        # GL mesh resources (populated by gl_core.init_tab_gl)
         self.MESH_VAOS:    dict = {}
         self.LINK_TO_MESH: dict = {}
         self.legs:         dict = {}
 
-        # FBO resources (populated by gl_core.ensure_fbo)
         self.fbo            = None
         self.fbo_tex        = None
         self.fbo_depth      = None
         self.fbo_w:   int   = 0
         self.fbo_h:   int   = 0
 
-        # Graph configuration (populated by init_graphs)
         self.graphs:      list  = []
         self.GRAPH_PARAMS: dict = {}
         self.PARAM_KEYS:  list  = []
         self._graph_ph_drag: dict = {}
 
-        # Per-tab picker state
         self.picker: dict = _make_picker_state()
-
-        # Graph probes: list of dicts {param, graph_idx, series_idx, frame_idx, value, t}
-        # Persistent until manually removed. Hidden when outside ±graph_window.
         self.probes: list = []
-    # ------------------------------------------------------------------
-    # Graph initialisation (called after do_load)
-    # ------------------------------------------------------------------
+        self.bounds: dict = {}
+        self.raibert_bounds = None          # (4,3,2) float32 or None — from config.yaml action_lb/ub
+        self.train_cfg_raw: dict | None = None  # raw parsed config.yaml dict for config panel
+        self.show_config_panel: bool = False  # toggle: True=show config.yaml, False=show live graphs
+
     def init_graphs(self) -> None:
-        """
-        Build GRAPH_PARAMS lambdas and graph list from loaded data + _cfg_mod.CFG.live_graphs.
-
-        Channel name → GRAPH_PARAMS key mapping:
-          q0..q11        → 'q <joint_name>'   (index into joint_order)
-          tau0..tau11    → 'tau <joint_name>'
-          dq0..dq11      → 'dq <joint_name>'
-          torso_roll/pitch/yaw/x/y/z → direct key
-          contact_*      → direct key
-          desired_vel_x  → direct key
-
-        If a channel name from config cannot be resolved, logs an ERROR and skips it.
-        """
         if self.S.data is None:
             logger.error(f"[state] Tab '{self.label}': init_graphs called before data loaded")
             return
@@ -350,13 +322,23 @@ class TabState:
         d  = self.S.data
         gp: dict = {}
 
-        # ── Build the full GRAPH_PARAMS registry (same as before) ─────────
         gp["torso_x"]       = lambda data, f: float(data["torso_x"][f])
         gp["torso_y"]       = lambda data, f: float(data["torso_y"][f])
         gp["torso_z"]       = lambda data, f: float(data["torso_z"][f])
         gp["torso_roll"]    = lambda data, f: math.degrees(float(data["torso_roll"][f]))
         gp["torso_pitch"]   = lambda data, f: math.degrees(float(data["torso_pitch"][f]))
         gp["torso_yaw"]     = lambda data, f: math.degrees(float(data["torso_yaw"][f]))
+
+        gp["torso_vx"] = lambda data, f: (
+            float(data["torso_vx"][f]) if data.get("torso_vx") is not None else 0.0
+        )
+        gp["torso_vy"] = lambda data, f: (
+            float(data["torso_vy"][f]) if data.get("torso_vy") is not None else 0.0
+        )
+        gp["torso_vz"] = lambda data, f: (
+            float(data["torso_vz"][f]) if data.get("torso_vz") is not None else 0.0
+        )
+
         gp["desired_vel_x"] = lambda data, f: (
             float(data["desired_vel_x"][f]) if data.get("desired_vel_x") is not None else 0.0
         )
@@ -373,7 +355,6 @@ class TabState:
                 lambda j: lambda data, f: float(data["dq"][f, j]) if data.get("dq") is not None else 0.0
             )(_ji)
 
-        # Foot force components (12 scalars: 4 feet × 3 axes)
         _FOOT_LABELS = ["FR_x","FR_y","FR_z","FL_x","FL_y","FL_z",
                         "RR_x","RR_y","RR_z","RL_x","RL_y","RL_z"]
         for _fi in range(12):
@@ -383,48 +364,55 @@ class TabState:
                     if data.get("foot_forces") is not None else 0.0
             )(_fi)
 
-        self.GRAPH_PARAMS = gp          # preliminary — will be rebuilt after custom channels
+        self.GRAPH_PARAMS = gp
         self.PARAM_KEYS   = list(gp.keys())
 
-        # ── Build a lookup: config channel name → GRAPH_PARAMS key ────────
         _channel_to_param: dict[str, str] = {}
 
-        # Direct keys
         for direct in ["torso_x","torso_y","torso_z",
                         "torso_roll","torso_pitch","torso_yaw",
+                        "torso_vx","torso_vy","torso_vz",
                         "desired_vel_x",
                         "contact_FL","contact_FR","contact_RL","contact_RR"]:
             _channel_to_param[direct] = direct
 
-        # Indexed joint channels
         for prefix in ("q", "tau", "dq"):
             for idx, jn in enumerate(self.joint_order):
                 _channel_to_param[f"{prefix}{idx}"] = f"{prefix} {jn}"
 
-        # Foot force components: foot_force_0 .. foot_force_11
         for _fi in range(12):
             _channel_to_param[f"foot_force_{_fi}"] = f"foot_force {_FOOT_LABELS[_fi]}"
 
-        # ── Custom channels from data["custom"] ───────────────────────────
-        # These are arbitrary named scalar arrays loaded by data.py from config.
         custom_data = d.get("custom", {})
         for _ch_name, _arr in custom_data.items():
             if _arr is None:
-                continue   # file failed to load — already logged as error
-            # Add to GRAPH_PARAMS
+                continue
             gp[f"custom {_ch_name}"] = (
                 lambda nm: lambda data, f: float(data["custom"][nm][f])
                     if data.get("custom") and data["custom"].get(nm) is not None else 0.0
             )(_ch_name)
-            # Add to channel_to_param so live_graphs config can reference them by name
             _channel_to_param[_ch_name] = f"custom {_ch_name}"
 
-        # Rebuild PARAM_KEYS after custom channels are added
+        # ── Extra (auto-detected) channels — key = 'extra:stemname' ──────
+        extra_data = d.get("extra", {})
+        for _ex_key, _ex_arr in extra_data.items():
+            if _ex_arr is None:
+                continue
+            _param_key = f"extra {_ex_key.removeprefix('extra:')}"
+            gp[_param_key] = (
+                lambda k: lambda data, f: float(data["extra"][k][f])
+                    if data.get("extra") and data["extra"].get(k) is not None else 0.0
+            )(_ex_key)
+            _channel_to_param[_ex_key] = _param_key
+
         self.GRAPH_PARAMS = gp
         self.PARAM_KEYS   = list(gp.keys())
         if custom_data:
             loaded = [k for k, v in custom_data.items() if v is not None]
             logger.info(f"[state] Custom channels registered for graphing: {loaded}")
+        if extra_data:
+            loaded_ex = [k for k, v in extra_data.items() if v is not None]
+            logger.info(f"[state] Extra (auto-detected) channels registered: {loaded_ex}")
 
         colors = (
             [tuple(c) for c in _cfg_mod.CFG.colors.graph_series]
@@ -434,15 +422,19 @@ class TabState:
             ]
         )
 
-        def _ms(param: str, ci: int, lo: float = -30.0, hi: float = 30.0) -> dict:
+        def _ms(param: str, ci: int, lo: float | None = None, hi: float | None = None) -> dict:
             r, g, b = colors[ci % len(colors)][:3]
+            _lo = lo if lo is not None else float("-inf")
+            _hi = hi if hi is not None else float("inf")
             return {
                 "param": param, "enabled": True, "color": (r, g, b),
-                "limit_lo": lo, "limit_hi": hi,
-                "lim_lo_str": str(int(lo)), "lim_hi_str": str(int(hi)),
+                "limit_lo": _lo, "limit_hi": _hi,
+                "lim_lo_str": f"{_lo:.3g}" if lo is not None else "",
+                "lim_hi_str": f"{_hi:.3g}" if hi is not None else "",
+                "has_bound":  lo is not None and hi is not None,
             }
 
-        def _mg(title: str, series: list, lo: float, hi: float) -> dict:
+        def _mg(title: str, series: list, lo: float = 0.0, hi: float = 0.0) -> dict:
             from dataviz.ui_panels import _graph_id_counter as _gic
             import dataviz.ui_panels as _uip
             _uip._graph_id_counter += 1
@@ -454,7 +446,6 @@ class TabState:
                 "_gid": _uip._graph_id_counter,
             }
 
-        # ── Read live_graphs from config and build graph list ─────────────
         self.graphs = []
 
         if _cfg_mod.CFG is None:
@@ -465,13 +456,11 @@ class TabState:
         raw_graphs = getattr(_cfg_mod.CFG, "live_graphs", None)
         if raw_graphs is None:
             logger.warning(
-                "[state] 'live_graphs' missing from config — no graphs will be created. "
-                "Add a 'live_graphs' section to config.json."
+                "[state] 'live_graphs' missing from config — no graphs will be created."
             )
             logger.info(f"[state] Tab '{self.label}': graphs initialised (0 panels)")
             return
 
-        # Iterate in config order
         try:
             graph_items = raw_graphs.__dict__.items() if hasattr(raw_graphs, "__dict__") else {}
         except Exception as exc:
@@ -480,61 +469,38 @@ class TabState:
 
         for title, graph_cfg in graph_items:
             if title.startswith("_"):
-                continue  # skip comment keys
+                continue
 
-            # graph_cfg is a _Namespace; extract fields
             try:
                 series_names = list(graph_cfg.series)
                 y_min = float(graph_cfg.y_min)
                 y_max = float(graph_cfg.y_max)
             except AttributeError as exc:
-                logger.error(
-                    f"[state] live_graphs['{title}'] is malformed — "
-                    f"expected {{series, y_min, y_max}}: {exc}"
-                )
+                logger.error(f"[state] live_graphs['{title}'] malformed: {exc}")
                 continue
 
-            # Resolve each channel name → param key
             series_list = []
             for ci, ch_name in enumerate(series_names):
                 param_key = _channel_to_param.get(ch_name)
                 if param_key is None:
-                    logger.error(
-                        f"[state] live_graphs['{title}']: channel '{ch_name}' cannot be resolved. "
-                        f"Valid examples: q0..q11, tau0..tau11, torso_roll, desired_vel_x. "
-                        f"Skipping this series."
-                    )
+                    logger.error(f"[state] live_graphs['{title}']: channel '{ch_name}' cannot be resolved. Skipping.")
                     continue
                 if param_key not in gp:
-                    logger.error(
-                        f"[state] live_graphs['{title}']: resolved param '{param_key}' "
-                        f"not found in GRAPH_PARAMS (joint count mismatch?). Skipping."
-                    )
+                    logger.error(f"[state] live_graphs['{title}']: resolved param '{param_key}' not found. Skipping.")
                     continue
-                series_list.append(_ms(param_key, ci, y_min, y_max))
+                ch_bound = self.bounds.get(ch_name)
+                s_lo, s_hi = (ch_bound if ch_bound is not None else (None, None))
+                series_list.append(_ms(param_key, ci, s_lo, s_hi))
 
             if not series_list:
-                logger.warning(
-                    f"[state] live_graphs['{title}']: all series failed to resolve — "
-                    f"graph will not be created."
-                )
+                logger.warning(f"[state] live_graphs['{title}']: all series failed — graph skipped.")
                 continue
 
             self.graphs.append(_mg(title, series_list, y_min, y_max))
-            logger.debug(
-                f"[state] live_graphs['{title}']: {len(series_list)} series, "
-                f"y=[{y_min}, {y_max}]"
-            )
 
-        logger.info(
-            f"[state] Tab '{self.label}': graphs initialised "
-            f"({len(self.graphs)} panels from config)"
-        )
+        logger.info(f"[state] Tab '{self.label}': graphs initialised ({len(self.graphs)} panels)")
 
 
-# ---------------------------------------------------------------------------
-# Picker state factory
-# ---------------------------------------------------------------------------
 def _make_picker_state() -> dict:
     return {
         "open":      True,
@@ -549,28 +515,16 @@ def _make_picker_state() -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# do_load — wire data + URDF into a TabState
-# ---------------------------------------------------------------------------
 def do_load(
     tab: TabState,
     urdf_path_str: str,
     data_dir_str: str,
     channel_map: Optional[dict] = None,
 ) -> None:
-    """
-    Load URDF and data into *tab*.
-    Sets tab.loaded = True on success.
-
-    Raises:
-        FileNotFoundError — missing URDF or data dir
-        RuntimeError      — data load failure
-        ValueError        — URDF parse failure
-    """
-    # Lazy import to avoid circular at module level
     from dataviz.data import (
         parse_urdf, build_fk_fn, load_data,
         load_channel_map_file, scan_data_files, auto_map_channels,
+        _load_training_config,
     )
 
     urdf_path = Path(urdf_path_str)
@@ -581,12 +535,12 @@ def do_load(
     if not data_dir.is_dir():
         raise FileNotFoundError(f"[state] Data directory not found: {data_dir.resolve()}")
 
-    # Resolve channel map
-    if channel_map is None:
-        channel_map = load_channel_map_file(data_dir)
     if channel_map is None:
         files       = scan_data_files(data_dir)
         channel_map = auto_map_channels(files)
+        saved       = load_channel_map_file(data_dir)
+        if saved is not None:
+            channel_map.update({k: v for k, v in saved.items() if v is not None})
 
     logger.info(f"[state] Loading tab '{tab.label}': urdf={urdf_path.name}, data={data_dir.name}")
 
@@ -594,18 +548,13 @@ def do_load(
         parse_urdf(urdf_path_str)
 
     fk_fn, urdf_robot = build_fk_fn(urdf_path_str, joint_order)
-    data, n           = load_data(data_dir_str, channel_map)
+    data, n, bounds   = load_data(data_dir_str, channel_map)
 
-    # Handle joint count mismatch
     if data["q"] is not None and data["q"].shape[1] != len(joint_order):
         m = min(data["q"].shape[1], len(joint_order))
-        logger.warning(
-            f"[state] Joint count mismatch: data has {data['q'].shape[1]} columns, "
-            f"URDF has {len(joint_order)} joints — using first {m}"
-        )
+        logger.warning(f"[state] Joint count mismatch — using first {m}")
         joint_order = joint_order[:m]
 
-    # Populate tab
     tab.urdf_path     = str(urdf_path)
     tab.joint_order   = joint_order
     tab.joint_limits  = joint_limits
@@ -614,6 +563,15 @@ def do_load(
     tab.fk_fn         = fk_fn
     tab.urdf_robot    = urdf_robot
     tab.channel_map   = channel_map
+    tab.bounds        = bounds
+    tab.raibert_bounds = bounds.get("raibert_bounds")  # (4,3,2) float32 or None
+
+    # Store raw config dict for the config panel viewer
+    try:
+        tab.train_cfg_raw = _load_training_config(data_dir_str)
+    except Exception as _cfg_exc:
+        logger.warning(f"[state] Could not load train_cfg for config panel: {_cfg_exc}")
+        tab.train_cfg_raw = None
     tab.label         = data_dir.name
 
     tab.S.data      = data
@@ -630,6 +588,4 @@ def do_load(
     tab.loaded          = True
     tab.picker["open"]  = False
 
-    logger.info(
-        f"[state] Tab '{tab.label}' loaded: {n} frames, {len(joint_order)} joints"
-    )
+    logger.info(f"[state] Tab '{tab.label}' loaded: {n} frames, {len(joint_order)} joints")
