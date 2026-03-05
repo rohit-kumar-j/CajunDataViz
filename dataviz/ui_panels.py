@@ -107,6 +107,32 @@ def _ui_image(tex_id: int, w: float, h: float) -> None:
         imgui.image(tex_id, w, h, uv0=(0, 1), uv1=(1, 0))
 
 
+def _ui_image_crop(tex_id: int, w: float, h: float,
+                   zoom: float = 1.0, pan_x: float = 0.0, pan_y: float = 0.0) -> None:
+    """Display a texture with crop/zoom via UV offsets.
+    zoom > 1 zooms in; pan_x/pan_y shift the visible window in UV space.
+    Y is flipped to correct OpenGL bottom-up convention.
+    """
+    half  = 0.5 / max(0.01, zoom)
+    cx    = 0.5 + pan_x
+    cy    = 0.5 + pan_y   # in natural image space (0=top, 1=bottom)
+    # OpenGL UV: Y=0 at bottom, Y=1 at top → flip
+    uv0   = (cx - half, 1.0 - cy + half)
+    uv1   = (cx + half, 1.0 - cy - half)
+    if _IMGUI_BACKEND == "bundle":
+        try:
+            imgui.image(tex_id, (w, h), uv0, uv1)
+        except TypeError:
+            try:
+                t_ref = imgui.ImTextureID(int(tex_id))
+                imgui.image(t_ref, (w, h), uv0, uv1)
+            except AttributeError:
+                t_ref = imgui.ImTextureRef(int(tex_id))
+                imgui.image(t_ref, (w, h), uv0, uv1)
+    else:
+        imgui.image(tex_id, w, h, uv0=uv0, uv1=uv1)
+
+
 def _ui_get_mouse_pos() -> tuple[float, float]:
     pos = imgui.get_mouse_pos()
     try:    return pos.x, pos.y
@@ -1490,6 +1516,19 @@ def render_settings(tab: TabState, ui: UIState) -> None:
     if S.cam_follow_mode == "free":
         imgui.same_line()
         imgui.text_colored((0.55, 0.85, 0.55, 1.0), "  WASD / QE to fly")
+    imgui.same_line()
+    trail_mid_available = getattr(S, "show_trail_frames", False)
+    if not trail_mid_available:
+        imgui.begin_disabled()
+    if imgui.radio_button("Trail Mid##ftm", S.cam_follow_mode == "trail_mid"):
+        if S.cam_follow_mode == "free":
+            S.exit_free_cam("trail_mid")
+        else:
+            S.cam_follow_mode = "trail_mid"
+            S.update_cam()
+    if not trail_mid_available:
+        imgui.end_disabled()
+        imgui.set_item_tooltip("Enable Trail Frames first")
 
     imgui.push_item_width(sc(80))
     cv, vv = imgui.drag_float("Yaw##cy",   S.cam_yaw,   0.5, -180, 180, "%.0f°")
@@ -1880,3 +1919,325 @@ def render_timeline(tab: TabState, avail_w: float, avail_h: float, ui: UIState) 
         S.loop_start = 0; S.loop_end = 0
     imgui.same_line()
     imgui.text_disabled(f"{lo2}-{hi2}")
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Strip View UI
+# ---------------------------------------------------------------------------
+def draw_strip_view(sv, tab_registry: list, gl_resources, ui: UIState) -> None:
+    from dataviz.gl_core import render_strip_row, delete_strip_row_fbo
+    # render_timeline is defined in this same module — direct reference, no copy
+    sc = ui.sc
+
+    total_w, total_h = _ui_get_content_region_avail()
+    total_w = int(total_w); total_h = int(total_h)
+
+    HEADER_H = sc(18) if sv.show_borders else 0
+    HANDLE_H = sc(5)  if sv.show_borders else sc(2)
+    BOTTOM_H = sc(220)
+    rows_area = max(sc(40), total_h - BOTTOM_H - sc(4))
+
+    if not sv.rows:
+        imgui.spacing()
+        imgui.text_colored((0.45, 0.45, 0.50, 1.0),
+                           "No runs added.  Click + Add to Strip in any run tab.")
+        return
+
+    sv._selected_row = max(0, min(sv._selected_row, len(sv.rows) - 1))
+    n   = len(sv.rows)
+    io  = imgui.get_io()
+    dx, dy = _ui_get_mouse_delta()
+
+    # ── Release drag ownership when mouse buttons released ───────────────
+    if not imgui.is_mouse_down(1):
+        sv._orbit_owner = ""
+    if not imgui.is_mouse_down(0):
+        sv._pan_owner = ""
+
+    # ── Apply owned drags ─────────────────────────────────────────────────
+    if sv._orbit_owner:
+        row = next((r for r in sv.rows if r.row_id == sv._orbit_owner), None)
+        if row and (abs(dx) > 0.01 or abs(dy) > 0.01):
+            row.orbit_yaw   -= dx * 0.45
+            row.orbit_pitch += dy * 0.30
+            row.orbit_pitch  = max(-88.0, min(88.0, row.orbit_pitch))
+
+    if sv._pan_owner:
+        row = next((r for r in sv.rows if r.row_id == sv._pan_owner), None)
+        src = next((t for t in tab_registry if row and t.id == row.tab_id and t.loaded), None)
+        if row and src and (abs(dx) > 0.01 or abs(dy) > 0.01):
+            import math as _m, numpy as _np
+            S   = src.S
+            rh  = int(max(sc(30), row.height))
+            yr  = _m.radians(float(S.cam_yaw) + float(row.orbit_yaw))
+            if getattr(S, "cam_ortho", False):
+                scale = float(getattr(S, "cam_ortho_scale", 1.2))
+                wpp   = (2.0 * scale / max(0.01, row.zoom_scale)) / max(1, rh)
+            else:
+                dist = float(getattr(S, "cam_dist", 3.5)) / max(0.01, row.zoom_scale)
+                fov  = float(getattr(S, "cam_fov", 60.0))
+                wpp  = 2.0 * dist * _m.tan(_m.radians(fov * 0.5)) / max(1, rh)
+            right = _np.array([-_m.sin(yr), _m.cos(yr), 0.0])
+            pan   = list(row.pan_offset)
+            pan[0] -= dx * wpp * right[0]
+            pan[1] -= dx * wpp * right[1]
+            pan[2] += dy * wpp
+            row.pan_offset = pan
+
+    _ui_begin_child("##sv_rows", total_w, rows_area, False,
+                    imgui.WindowFlags_.no_scrollbar)
+
+    for ri, row in enumerate(sv.rows):
+        src      = next((t for t in tab_registry if t.id == row.tab_id and t.loaded), None)
+        selected = (ri == sv._selected_row)
+        rh       = int(max(sc(30), row.height))
+        imgui.push_id(f"svrow_{row.row_id}")
+
+        # ── Header bar (when borders visible) ─────────────────────────
+        if sv.show_borders:
+            hdr_bg = (0.18, 0.28, 0.45, 1.0) if selected else (0.12, 0.14, 0.18, 1.0)
+            _ui_push_style_color(imgui.Col_.child_bg, *hdr_bg)
+            imgui.push_style_var(imgui.StyleVar_.item_spacing, (sc(4), 0))
+            _ui_begin_child(f"##svhdr_{row.row_id}", total_w, HEADER_H, False,
+                            imgui.WindowFlags_.no_scrollbar)
+            imgui.set_cursor_pos_y(sc(2))
+            lbl_col = (0.55, 0.85, 1.0, 1.0) if selected else (0.65, 0.65, 0.70, 1.0)
+            imgui.text_colored(lbl_col, f" {row.label}")
+            imgui.same_line(spacing=sc(6))
+            imgui.text_disabled("scroll=zoom  LMB=pan  Ctrl+RMB=orbit")
+            imgui.same_line(spacing=0)
+            imgui.set_cursor_pos_x(total_w - sc(62))
+
+            imgui.begin_disabled() if ri == 0 else None
+            if _ui_button(f"^##svu_{row.row_id}", sc(18), sc(14)):
+                sv.rows[ri], sv.rows[ri-1] = sv.rows[ri-1], sv.rows[ri]
+                sv._selected_row = ri - 1
+            if ri == 0: imgui.end_disabled()
+            imgui.set_item_tooltip("Move row up")
+
+            imgui.same_line(spacing=sc(2))
+            imgui.begin_disabled() if ri == n-1 else None
+            if _ui_button(f"v##svd_{row.row_id}", sc(18), sc(14)):
+                sv.rows[ri], sv.rows[ri+1] = sv.rows[ri+1], sv.rows[ri]
+                sv._selected_row = ri + 1
+            if ri == n-1: imgui.end_disabled()
+            imgui.set_item_tooltip("Move row down")
+
+            imgui.same_line(spacing=sc(2))
+            _ui_push_style_color(imgui.Col_.button,         0.55, 0.10, 0.10, 0.85)
+            _ui_push_style_color(imgui.Col_.button_hovered, 0.80, 0.20, 0.20, 1.00)
+            _ui_push_style_color(imgui.Col_.button_active,  1.00, 0.30, 0.30, 1.00)
+            del_clicked = _ui_button(f"X##xbtn_{row.row_id}", sc(18), sc(14))
+            imgui.pop_style_color(3)
+            imgui.end_child()
+            imgui.pop_style_var()
+            imgui.pop_style_color()
+
+            if del_clicked:
+                try: delete_strip_row_fbo(row)
+                except Exception: pass
+                sv.rows.pop(ri)
+                sv._selected_row = max(0, sv._selected_row - 1)
+                imgui.pop_id()
+                break
+
+        # ── Render into FBO ───────────────────────────────────────────
+        ok = (src is not None and
+              render_strip_row(row, src, gl_resources, total_w, rh))
+
+        # ── Image rendered INLINE (no child window → reliable hover) ──
+        imgui.push_style_var(imgui.StyleVar_.item_spacing, (0.0, 0.0))
+
+        if ok and row.fbo_tex is not None:
+            _ui_image(int(row.fbo_tex.value), total_w, rh)
+        else:
+            # Placeholder dummy item so hover still works
+            imgui.dummy((total_w, rh))
+
+        imgui.pop_style_var()
+
+        # is_item_hovered() on the just-drawn image/dummy — always works
+        item_hovered = imgui.is_item_hovered()
+
+        # Click → select
+        if item_hovered and imgui.is_mouse_clicked(0):
+            sv._selected_row = ri
+
+        # Ctrl+RMB pressed on this item → claim orbit ownership
+        if item_hovered and io.key_ctrl and imgui.is_mouse_clicked(1):
+            sv._selected_row = ri
+            sv._orbit_owner  = row.row_id
+
+        # LMB pressed (no ctrl) → claim pan ownership
+        if item_hovered and not io.key_ctrl and imgui.is_mouse_clicked(0):
+            sv._pan_owner = row.row_id
+
+        # Scroll → zoom
+        if item_hovered:
+            wheel = io.mouse_wheel
+            if wheel != 0.0:
+                sv._selected_row = ri
+                row.zoom_scale = max(0.05, float(row.zoom_scale) * (1.15 ** wheel))
+
+        # Border highlight for selected row via draw list
+        if sv.show_borders and selected:
+            dl = imgui.get_window_draw_list()
+            try:
+                pos = imgui.get_item_rect_min()
+                mx  = float(pos.x) if hasattr(pos, 'x') else float(pos[0])
+                my  = float(pos.y) if hasattr(pos, 'y') else float(pos[1])
+                dl.add_rect((mx, my), (mx + total_w, my + rh),
+                            imgui.get_color_u32((0.35, 0.75, 1.0, 0.9)), 0.0, 0, 2.0)
+            except Exception:
+                pass
+
+        # ── Resize handle ─────────────────────────────────────────────
+        if sv.show_borders:
+            _ui_push_style_color(imgui.Col_.button,         0.16, 0.18, 0.24, 0.8)
+            _ui_push_style_color(imgui.Col_.button_hovered, 0.35, 0.65, 1.00, 0.9)
+            _ui_push_style_color(imgui.Col_.button_active,  0.45, 0.75, 1.00, 1.0)
+        else:
+            _ui_push_style_color(imgui.Col_.button,         0.0, 0.0, 0.0, 0.0)
+            _ui_push_style_color(imgui.Col_.button_hovered, 0.3, 0.5, 1.0, 0.3)
+            _ui_push_style_color(imgui.Col_.button_active,  0.4, 0.6, 1.0, 0.5)
+        _ui_button(f"##svrsz_{row.row_id}", total_w, HANDLE_H)
+        imgui.pop_style_color(3)
+        if imgui.is_item_active():
+            _, rdy = _ui_get_mouse_delta()
+            row.height = max(sc(30), int(row.height + rdy))
+        if imgui.is_item_hovered() or imgui.is_item_active():
+            imgui.set_mouse_cursor(imgui.MouseCursor_.resize_ns)
+        imgui.set_item_tooltip("Drag to resize")
+
+        imgui.pop_id()
+
+    imgui.end_child()
+    imgui.separator()
+
+    # ── Bottom controls ────────────────────────────────────────────────────
+    sel_row = sv.rows[sv._selected_row] if sv.rows else None
+    sel_src = next((t for t in tab_registry
+                    if sel_row and t.id == sel_row.tab_id and t.loaded), None)
+
+    _ui_push_style_color(imgui.Col_.child_bg, 0.10, 0.12, 0.16, 1.0)
+    _ui_begin_child("##sv_ctrl", total_w, BOTTOM_H, False)
+
+    if sel_row is not None and sel_src is not None:
+        S = sel_src.S
+        imgui.text_colored((0.50, 0.80, 1.0, 1.0), f"  {sel_row.label}")
+        imgui.same_line(spacing=sc(10))
+        imgui.text_disabled("camera + pan/zoom/orbit")
+        imgui.same_line(spacing=sc(18))
+        _ui_push_style_color(imgui.Col_.check_mark,
+                             *(0.35, 0.75, 1.0, 1.0) if sv.show_borders else (0.4, 0.4, 0.4, 1.0))
+        ch, bv = imgui.checkbox("Borders##svbrd", sv.show_borders)
+        imgui.pop_style_color()
+        if ch: sv.show_borders = bv
+        imgui.set_item_tooltip("Hide for clean screenshots")
+        imgui.separator()
+
+        x = sel_row.row_id
+        imgui.push_item_width(sc(72))
+        cv, vv = imgui.drag_float(f"Yaw##sy{x}",   S.cam_yaw,   0.5, -180, 180, "%.0f°")
+        if cv: S.cam_yaw = vv; S.update_cam()
+        imgui.same_line()
+        cv, vv = imgui.drag_float(f"Pitch##sp{x}", S.cam_pitch, 0.3, 1, 89, "%.0f°")
+        if cv: S.cam_pitch = vv; S.update_cam()
+        imgui.same_line()
+        if getattr(S, "cam_ortho", False):
+            cv, vv = imgui.drag_float(f"Scale##ss{x}", getattr(S, "cam_ortho_scale", 1.2),
+                                      0.02, 0.05, 20, "%.2fm")
+            if cv: S.cam_ortho_scale = max(0.05, vv)
+        else:
+            cv, vv = imgui.drag_float(f"Dist##sd{x}", S.cam_dist, 0.05, 0.3, 30, "%.1fm")
+            if cv: S.cam_dist = vv; S.update_cam()
+        imgui.same_line()
+        cv, vv = imgui.drag_float(f"Zoom##sz{x}", sel_row.zoom_scale, 0.02, 0.05, 20, "%.2fx")
+        if cv: sel_row.zoom_scale = max(0.05, vv)
+        imgui.same_line()
+        cv, vv = imgui.drag_int(f"H##sh{x}", sel_row.height, 2, sc(30), sc(800), "%dpx")
+        if cv: sel_row.height = max(sc(30), vv)
+        imgui.pop_item_width()
+        imgui.same_line()
+        if _ui_button(f"Reset##sr{x}"):
+            sel_row.pan_offset  = [0.0, 0.0, 0.0]
+            sel_row.zoom_scale  = 1.0
+            sel_row.orbit_yaw   = 0.0
+            sel_row.orbit_pitch = 0.0
+            sel_row.height      = sc(200)
+        # ── Ground / Background / Trail controls (operate on same S) ──────
+        imgui.separator()
+        S2 = sel_src.S  # alias — same object as in run tab, so changes sync
+
+        # Show Ground
+        _ui_push_style_color(imgui.Col_.check_mark,
+            *(0.55, 0.85, 0.55, 1.0) if getattr(S2,"show_ground",True) else (0.5,0.5,0.5,1.0))
+        ch, gv = imgui.checkbox("Ground##sv_sg", getattr(S2, "show_ground", True))
+        imgui.pop_style_color()
+        if ch: S2.show_ground = gv
+
+        imgui.same_line(spacing=sc(12))
+
+        # Custom Background + colour picker
+        bg_custom = getattr(S2, "bg_custom", False)
+        _ui_push_style_color(imgui.Col_.check_mark,
+            *(0.40, 0.80, 1.00, 1.0) if bg_custom else (0.5,0.5,0.5,1.0))
+        ch, bg_custom = imgui.checkbox("Custom BG##sv_sbg", bg_custom)
+        imgui.pop_style_color()
+        if ch: S2.bg_custom = bg_custom
+        if bg_custom:
+            imgui.same_line()
+            bg = list(getattr(S2, "bg_color", [0.52, 0.60, 0.68, 1.0]))
+            while len(bg) < 4: bg.append(1.0)
+            try:
+                ch2, new_bg = imgui.color_edit4("##sv_bgcol", tuple(bg[:4]),
+                    imgui.ColorEditFlags_.no_label | imgui.ColorEditFlags_.alpha_bar |
+                    imgui.ColorEditFlags_.picker_hue_wheel)
+            except Exception:
+                ch2, new_bg = imgui.color_edit4("##sv_bgcol", tuple(bg[:4]))
+            if ch2: S2.bg_color = list(new_bg)
+
+        imgui.same_line(spacing=sc(12))
+
+        # Trail enable + count + interval
+        if hasattr(S2, "show_trail_frames"):
+            _ui_push_style_color(imgui.Col_.check_mark,
+                *(0.35, 1.00, 0.60, 1.0) if S2.show_trail_frames else (0.5,0.5,0.5,1.0))
+            ch, tv = imgui.checkbox("Trail##sv_etf", S2.show_trail_frames)
+            imgui.pop_style_color()
+            if ch: S2.show_trail_frames = tv
+            if S2.show_trail_frames:
+                imgui.same_line()
+                imgui.push_item_width(sc(55))
+                cv, vv = imgui.drag_int("Count##sv_tfn", S2.trail_num_frames, 1, 1, 20, "%d")
+                if cv: S2.trail_num_frames = max(1, min(20, vv))
+                imgui.pop_item_width()
+                imgui.same_line()
+                imgui.push_item_width(sc(65))
+                cv, vv = imgui.drag_int("Interval##sv_tfd", S2.trail_min_dist, 1, 1, 500, "%d fr")
+                if cv: S2.trail_min_dist = max(1, vv)
+                imgui.pop_item_width()
+
+        # ── Timeline for selected run (same TabState → fully synced) ──────
+        imgui.separator()
+        tl_w, tl_h = _ui_get_content_region_avail()
+        render_timeline(sel_src, float(tl_w), float(tl_h), ui)
+    elif sel_row is not None:
+        imgui.spacing()
+        imgui.text_colored((0.40, 0.40, 0.45, 1.0), f"  {sel_row.label}  tab not loaded")
+    else:
+        imgui.spacing()
+        imgui.text_colored((0.40, 0.40, 0.45, 1.0), "  Click a row to select it.")
+
+    imgui.end_child()
+    imgui.pop_style_color()

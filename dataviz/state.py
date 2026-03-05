@@ -56,8 +56,8 @@ class AppState:
         self.show_trail_frames:   bool  = False
         self.trail_num_frames:    int   = 5      # how many trail poses to show
         self.trail_min_dist:      int   = 15     # frame interval between each trail pose
-        self.trail_opacity_start: float = 0.45   # opacity of the most-recent trail pose
-        self.trail_opacity_end:   float = 0.06   # opacity of the oldest trail pose
+        self.trail_opacity_start: float = 1.0    # opacity of the most-recent trail pose
+        self.trail_opacity_end:   float = 1.0    # opacity of the oldest trail pose
 
         # ── Free-cam orbit backup — saved when entering free mode ──────────
         self._orbit_yaw_bak:   float = self.cam_yaw
@@ -204,11 +204,39 @@ class AppState:
         self.cam_follow_mode = mode
         self.update_cam()
 
+    def _mid_trail_target(self) -> Optional[np.ndarray]:
+        """Return torso position at the middle trail frame, or None if unavailable.
+        Middle index = ceil(trail_num_frames / 2), matching user convention:
+          5 frames → ceil(2.5)=3rd trail pose
+          6 frames → ceil(3)=3rd trail pose
+        """
+        import math as _m
+        if not getattr(self, "show_trail_frames", False) or self.data is None:
+            return None
+        n_trail  = max(1, getattr(self, "trail_num_frames", 5))
+        interval = max(1, getattr(self, "trail_min_dist",  15))
+        mid_i    = _m.ceil(n_trail / 2)
+        tf       = self.frame - mid_i * interval
+        if tf < 0:
+            return None
+        tf = min(tf, self.n_frames - 1)
+        return np.array([
+            float(self.data["torso_x"][tf]),
+            float(self.data["torso_y"][tf]),
+            float(self.data["torso_z"][tf]),
+        ])
+
     def update_cam(self) -> None:
         if self.cam_follow_mode == "free":
             # Keep cam_target 1 unit ahead so _lookat stays valid
             self.cam_target = self.cam_free_pos + self._free_cam_forward()
             return
+        if self.cam_follow_mode == "trail_mid":
+            tgt = self._mid_trail_target()
+            if tgt is not None:
+                self.cam_target = tgt
+                return
+            # Fall through to main-robot follow if trail unavailable
         if self.data is None:
             return
         G = self.g_ref
@@ -657,3 +685,50 @@ def do_load(
     tab.picker["open"]  = False
 
     logger.info(f"[state] Tab '{tab.label}' loaded: {n} frames, {len(joint_order)} joints")
+
+
+
+# ---------------------------------------------------------------------------
+# Strip View — live continuous ortho render per run, stacked vertically
+# ---------------------------------------------------------------------------
+import uuid as _uuid_mod
+import dataclasses as _dc
+
+
+@_dc.dataclass
+class StripRow:
+    """One run's live render row — mirrors source tab camera. Resizable height."""
+    row_id:   str    = _dc.field(default_factory=lambda: str(_uuid_mod.uuid4())[:8])
+    label:    str    = "Run"
+    tab_id:   int    = -1
+    # FBO for the live render
+    fbo:       object = None
+    fbo_tex:   object = None
+    fbo_depth: object = None
+    fbo_w:     int    = 0
+    fbo_h:     int    = 0
+    # Row pixel height — drag resize handle to change
+    height:    int    = 200
+    # Strip-local camera overrides (don't touch source tab's AppState)
+    # pan_offset is added to cam_target after update_cam()
+    pan_offset:   object = _dc.field(default_factory=lambda: [0.0, 0.0, 0.0])
+    zoom_scale:   float  = 1.0   # multiplies ortho_scale or cam_dist
+    # Ctrl+RMB orbit offsets (added to S.cam_yaw / S.cam_pitch locally)
+    orbit_yaw:    float  = 0.0
+    orbit_pitch:  float  = 0.0
+
+
+class StripViewState:
+    _id_counter: int = 0
+
+    def __init__(self, label: str = "Strip View"):
+        StripViewState._id_counter += 1
+        self.id:           int  = StripViewState._id_counter
+        self.label:        str  = label
+        self.rows:         list = []   # List[StripRow]
+        self._selected_row: int = 0
+        self._drag_row:     int = -1
+        self.show_borders:  bool = True
+        # Track which row owns the current drag (by row_id string, "" = none)
+        self._orbit_owner:  str  = ""
+        self._pan_owner:    str  = ""

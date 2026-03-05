@@ -35,6 +35,7 @@ try:
         glViewport, glClearColor, glClear,
         glEnable, glDisable, glDepthFunc,
         glBlendFunc,
+        glGetIntegerv,
         GL_VERTEX_SHADER, GL_FRAGMENT_SHADER,
         GL_COMPILE_STATUS, GL_LINK_STATUS, GL_INFO_LOG_LENGTH,
         GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER,
@@ -48,6 +49,7 @@ try:
         GL_LINEAR, GL_RENDERBUFFER, GL_DEPTH_COMPONENT24,
         GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
         GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_COMPLETE,
+        GL_VIEWPORT,
     )
 except ImportError as _e:
     raise ImportError(
@@ -1051,3 +1053,143 @@ def render_3d(tab, gl: GLResources, vp_w: int, vp_h: int) -> None:
             draw_line_seg(gl, origin, origin + Rw[:, 1] * Lf, (0, 1, 0, 0.9), mvp)
             draw_line_seg(gl, origin, origin + Rw[:, 2] * Lf, (0, 0, 1, 0.9), mvp)
             draw_sphere(gl, origin, Lf * 0.12, (0.9, 0.9, 0.2), proj, view, eye, fog_s, fog_e)
+
+
+# ---------------------------------------------------------------------------
+# Strip panel rendering
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Strip View — live mid-trail ortho rendering
+# ---------------------------------------------------------------------------
+def _ensure_row_fbo(row, w: int, h: int) -> None:
+    w = max(1, int(w)); h = max(1, int(h))
+    if row.fbo is not None and row.fbo_w == w and row.fbo_h == h:
+        return
+    if row.fbo is not None:
+        try:
+            glDeleteFramebuffers(1,  ctypes.byref(row.fbo))
+            glDeleteTextures(1,      ctypes.byref(row.fbo_tex))
+            glDeleteRenderbuffers(1, ctypes.byref(row.fbo_depth))
+        except Exception:
+            pass
+    fbo, tex, rbo = create_fbo(w, h)
+    row.fbo = fbo; row.fbo_tex = tex; row.fbo_depth = rbo
+    row.fbo_w = w; row.fbo_h = h
+
+
+def delete_strip_row_fbo(row) -> None:
+    if row.fbo is not None:
+        try:
+            glDeleteFramebuffers(1,  ctypes.byref(row.fbo))
+            glDeleteTextures(1,      ctypes.byref(row.fbo_tex))
+            glDeleteRenderbuffers(1, ctypes.byref(row.fbo_depth))
+        except Exception:
+            pass
+        row.fbo = row.fbo_tex = row.fbo_depth = None
+        row.fbo_w = row.fbo_h = 0
+
+
+def render_strip_row(row, tab, gl: GLResources, w: int, h: int) -> bool:
+    """Render the run tab into row.fbo with strip-local pan/zoom/orbit.
+    Never modifies tab.S.
+    """
+    w = int(w); h = int(h)
+    S = tab.S
+    if not tab.loaded or S.data is None:
+        return False
+
+    S.update_cam()
+    base_tgt = np.array(S.cam_target, dtype=float)
+    pan      = np.array(row.pan_offset, dtype=float)
+    tgt      = base_tgt + pan
+
+    import math as _m
+    # Apply strip-local orbit offsets on top of source tab's yaw/pitch
+    yaw   = float(S.cam_yaw)   + float(row.orbit_yaw)
+    pitch = float(S.cam_pitch) + float(row.orbit_pitch)
+    pitch = max(1.0, min(89.0, pitch))
+    yr = _m.radians(yaw)
+    pr = _m.radians(pitch)
+
+    if S.cam_follow_mode == "free":
+        direction = np.array(S.cam_target, dtype=float) - np.array(S.cam_free_pos, dtype=float)
+        eye = tgt - direction
+    else:
+        dist = float(getattr(S, "cam_dist", 3.5))
+        eye  = tgt + dist * np.array([
+            _m.cos(pr) * _m.cos(yr),
+            _m.cos(pr) * _m.sin(yr),
+            _m.sin(pr),
+        ])
+
+    saved_vp = (ctypes.c_int * 4)()
+    glGetIntegerv(GL_VIEWPORT, saved_vp)
+
+    _ensure_row_fbo(row, w, h)
+    glBindFramebuffer(GL_FRAMEBUFFER, row.fbo)
+    glViewport(0, 0, w, h)
+
+    if getattr(S, "bg_custom", False):
+        bg = list(getattr(S, "bg_color", [0.52, 0.60, 0.68, 1.0]))
+    else:
+        bg = _cfg_mod.CFG.colors.background if _cfg_mod.CFG else [0.52, 0.60, 0.68, 1.0]
+    glClearColor(*bg)
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL)
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+    asp = w / max(1, h)
+    zs  = max(0.01, float(row.zoom_scale))
+    if getattr(S, "cam_ortho", False):
+        half_h = float(getattr(S, "cam_ortho_scale", 1.2)) / zs
+        proj   = _ortho(half_h, asp, 0.01, 500.0)
+    else:
+        fov  = float(getattr(S, "cam_fov", 60.0))
+        proj = _persp(fov, asp, 0.01, 500.0)
+        if zs != 1.0:
+            eye = tgt + (eye - tgt) / zs
+
+    view = _lookat(eye, tgt, [0, 0, 1])
+
+    fog_s = float(getattr(S, "fog_start", 8.0))
+    fog_e = float(getattr(S, "fog_end",  20.0))
+
+    if getattr(S, "show_grid", True) and getattr(S, "show_ground", True):
+        draw_ground(gl, proj, view, eye, tgt, fog_s, fog_e)
+
+    robot_col = tuple(_cfg_mod.CFG.colors.robot_main[:3]) if _cfg_mod.CFG else (0.92, 0.92, 0.94)
+
+    if getattr(S, "show_trail_frames", False):
+        n_trail  = max(1, getattr(S, "trail_num_frames", 5))
+        interval = max(1, getattr(S, "trail_min_dist", 15))
+        op_start = float(getattr(S, "trail_opacity_start", 1.0))
+        op_end   = float(getattr(S, "trail_opacity_end",   1.0))
+        f = max(0, min(S.frame, S.n_frames - 1))
+        for i in range(n_trail, 0, -1):
+            tf = f - i * interval
+            if tf < 0: continue
+            t     = (i - 1) / max(n_trail - 1, 1)
+            alpha = max(0.01, min(1.0, op_start + (op_end - op_start) * t))
+            tq, tpos, trpy = S.frame_state(tf)
+            trail_T = tab.fk_fn(tq, tpos, trpy)
+            for link_name, mesh_key in tab.LINK_TO_MESH.items():
+                if link_name not in trail_T or mesh_key not in tab.MESH_VAOS: continue
+                vao, n_idx = tab.MESH_VAOS[mesh_key]
+                draw_mesh(vao, n_idx, gl.prog_lit, trail_T[link_name],
+                          robot_col, proj, view, eye, alpha, fog_s, fog_e)
+
+    f = max(0, min(S.frame, S.n_frames - 1))
+    q, pos, rpy = S.frame_state(f)
+    T = tab.fk_fn(q, pos, rpy)
+    for link_name, mesh_key in tab.LINK_TO_MESH.items():
+        if link_name not in T or mesh_key not in tab.MESH_VAOS: continue
+        vao, n_idx = tab.MESH_VAOS[mesh_key]
+        draw_mesh(vao, n_idx, gl.prog_lit, T[link_name],
+                  robot_col, proj, view, eye, 1.0, fog_s, fog_e)
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0)
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_BLEND)
+    glViewport(saved_vp[0], saved_vp[1], saved_vp[2], saved_vp[3])
+    return True

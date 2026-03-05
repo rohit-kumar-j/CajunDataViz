@@ -54,11 +54,12 @@ except ImportError:
         )
 
 from dataviz.config    import CFG, init_config
-from dataviz.state     import TabState, do_load
+from dataviz.state     import TabState, do_load, StripViewState, StripRow
 from dataviz.data      import find_robots_dir, scan_robots
 from dataviz.gl_core   import (
     GLResources, build_gl_resources,
     ensure_fbo, delete_fbo, render_3d, init_tab_gl,
+    delete_strip_row_fbo,
 )
 from dataviz.ui_panels import (
     UIState, make_ui_state,
@@ -72,6 +73,7 @@ from dataviz.ui_panels import (
     _UI_KEY_SPACE, _UI_KEY_LEFT, _UI_KEY_RIGHT,
     _UI_KEY_W, _UI_KEY_S, _UI_KEY_A, _UI_KEY_D, _UI_KEY_Q, _UI_KEY_E,
     _UI_TAB_SET_SELECTED,
+    draw_strip_view,
 )
 
 
@@ -233,6 +235,24 @@ def run_viewer(
     _ignore_plus_frames = 0
     _fbo_delete_queue   = []
 
+    # Strip views — separate list, shown as their own tab bar entries
+    _strip_views: list = []   # List[StripViewState]
+
+    def _add_run_to_strip(tab: TabState) -> None:
+        """Add this run as a live row in the strip view (one row per run)."""
+        if not tab.loaded:
+            return
+        if not _strip_views:
+            sv = StripViewState("Strip View")
+            _strip_views.append(sv)
+        else:
+            sv = _strip_views[0]
+        if any(r.tab_id == tab.id for r in sv.rows):
+            logger.info(f"[viewer] '{tab.label}' already in strip view")
+            return
+        sv.rows.append(StripRow(label=tab.label, tab_id=tab.id))
+        logger.info(f"[viewer] Added '{tab.label}' → strip view")
+
     # Native key-state tracking — bypasses imgui key routing entirely.
     # Pyglet on_key_press/on_key_release keep this set current every frame.
     # Only the six free-cam movement keys are tracked here.
@@ -351,7 +371,7 @@ def run_viewer(
                 else:
                     yr = math.radians(S.cam_yaw)
                     r  = np.array([-math.sin(yr), math.cos(yr), 0.0])
-                    S.cam_target += r * (-dx * pan) + np.array([0, 0, 1]) * (dy * pan)
+                    S.cam_target += r * (dx * pan) + np.array([0, 0, 1]) * (dy * pan)
 
             scroll = imgui.get_io().mouse_wheel
             if abs(scroll) > 0.01:
@@ -455,6 +475,15 @@ def run_viewer(
         if _ui_button("Save Layout##sl"): save_layout(tab, ui, win)
         imgui.same_line()
         if _ui_button("Load Layout##ll"): load_layout(tab, ui, win)
+        imgui.same_line()
+        # ── Capture current frame to strip view ───────────────────────────
+        _ui_push_style_color(imgui.Col_.button,         0.20, 0.50, 0.30, 0.85)
+        _ui_push_style_color(imgui.Col_.button_hovered, 0.28, 0.70, 0.42, 1.00)
+        _ui_push_style_color(imgui.Col_.button_active,  0.38, 0.85, 0.55, 1.00)
+        if _ui_button(f"➕ Add to Strip##capture_{tab.id}", sc(130), sc(22)):
+            _add_run_to_strip(tab)
+        imgui.pop_style_color(3)
+        imgui.set_item_tooltip("Add this run as a live row in Strip View")
         imgui.separator()
 
         if not show_cfg:
@@ -577,6 +606,25 @@ def run_viewer(
                     imgui.end_tab_item()
 
             _switch_to_tab = -1
+
+            # ── Strip View tabs ───────────────────────────────────────────
+            sv_to_remove = []
+            for sv in _strip_views:
+                sv_flags = imgui.TabItemFlags_.none
+                sv_opened, sv_keep = _ui_begin_tab_item_closable(
+                    f"🎞 {sv.label}##sv{sv.id}", sv_flags
+                )
+                if not sv_keep:
+                    sv_to_remove.append(sv)
+                if sv_opened:
+                    draw_strip_view(sv, _tabs, gl, ui)
+                    imgui.end_tab_item()
+
+            for sv in sv_to_remove:
+                for row in sv.rows:
+                    try: delete_strip_row_fbo(row)
+                    except Exception: pass
+                _strip_views.remove(sv)
 
             # '+' new-tab button
             if _ignore_plus_frames > 0:
