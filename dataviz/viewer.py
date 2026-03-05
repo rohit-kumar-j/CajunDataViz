@@ -70,6 +70,7 @@ from dataviz.ui_panels import (
     _ui_get_mouse_delta, _ui_get_mouse_pos,
     _ui_push_style_color, _ui_begin_tab_item, _ui_begin_tab_item_closable,
     _UI_KEY_SPACE, _UI_KEY_LEFT, _UI_KEY_RIGHT,
+    _UI_KEY_W, _UI_KEY_S, _UI_KEY_A, _UI_KEY_D, _UI_KEY_Q, _UI_KEY_E,
     _UI_TAB_SET_SELECTED,
 )
 
@@ -232,6 +233,23 @@ def run_viewer(
     _ignore_plus_frames = 0
     _fbo_delete_queue   = []
 
+    # Native key-state tracking — bypasses imgui key routing entirely.
+    # Pyglet on_key_press/on_key_release keep this set current every frame.
+    # Only the six free-cam movement keys are tracked here.
+    _FREE_CAM_KEYS = {
+        pyglet.window.key.W,
+        pyglet.window.key.S,
+        pyglet.window.key.A,
+        pyglet.window.key.D,
+        pyglet.window.key.Q,
+        pyglet.window.key.E,
+    }
+    _keys_held: set = set()
+
+    # Per-tab viewport focus: True when user has clicked inside the 3D panel.
+    # Free-cam WASD is only active when the viewport is focused AND hovered.
+    _vp_focused: dict = {}   # tab.id -> bool
+
     SPLITTER_W = CFG.layout.splitter_width if CFG else 6
     WIN_FLAGS  = (
         imgui.WindowFlags_.no_title_bar | imgui.WindowFlags_.no_resize |
@@ -287,31 +305,92 @@ def run_viewer(
         _ui_image(tex_id, rw, rh)
         img_hovered = imgui.is_item_hovered()
 
-        # Camera input
-        if img_hovered:
-            orb  = CFG.camera.orbit_sensitivity if CFG else 0.3
-            pan  = CFG.camera.pan_sensitivity   if CFG else 0.004
-            zoom = CFG.camera.zoom_sensitivity  if CFG else 0.3
+        # ── Viewport focus tracking ───────────────────────────────────────
+        # Clicking inside the rendered image gives free-cam keyboard focus.
+        # Clicking anywhere outside the child window clears it.
+        if imgui.is_item_clicked(0):
+            _vp_focused[tab.id] = True
+        vp_focused = _vp_focused.get(tab.id, False)
 
+        # If the mouse is pressed and NOT over this image, lose focus
+        if imgui.is_mouse_clicked(0) and not img_hovered:
+            _vp_focused[tab.id] = False
+            vp_focused = False
+
+        # Camera input
+        free_mode = S.cam_follow_mode == "free"
+        orb  = CFG.camera.orbit_sensitivity if CFG else 0.3
+        pan  = CFG.camera.pan_sensitivity   if CFG else 0.004
+        zoom = CFG.camera.zoom_sensitivity  if CFG else 0.3
+
+        # ── Mouse controls — only when viewport is hovered ────────────────
+        if img_hovered:
             if imgui.is_mouse_dragging(0):
                 dx, dy = _ui_get_mouse_delta()
                 S.cam_yaw  -= dx * orb
                 psign       = -1.0 if ui.invert_y else 1.0
-                S.cam_pitch = max(
-                    CFG.camera.min_pitch if CFG else 5.0,
-                    min(CFG.camera.max_pitch if CFG else 85.0,
-                        S.cam_pitch - dy * orb * psign)
-                )
+                if free_mode:
+                    S.cam_pitch  = max(-89.0, min(89.0,
+                        S.cam_pitch - dy * orb * psign))
+                    S.cam_target = S.cam_free_pos + S._free_cam_forward()
+                else:
+                    S.cam_pitch = max(
+                        CFG.camera.min_pitch if CFG else 5.0,
+                        min(CFG.camera.max_pitch if CFG else 85.0,
+                            S.cam_pitch - dy * orb * psign)
+                    )
+
             if imgui.is_mouse_dragging(1):
                 dx, dy = _ui_get_mouse_delta()
-                yr = math.radians(S.cam_yaw)
-                r  = np.array([-math.sin(yr), math.cos(yr), 0.0])
-                S.cam_target += r * (-dx * pan) + np.array([0, 0, 1]) * (dy * pan)
+                if free_mode:
+                    yr    = math.radians(S.cam_yaw)
+                    right = np.array([-math.sin(yr), math.cos(yr), 0.0])
+                    S.cam_free_pos += (right * (-dx * pan)
+                                      + np.array([0.0, 0.0, 1.0]) * (dy * pan))
+                    S.cam_target = S.cam_free_pos + S._free_cam_forward()
+                else:
+                    yr = math.radians(S.cam_yaw)
+                    r  = np.array([-math.sin(yr), math.cos(yr), 0.0])
+                    S.cam_target += r * (-dx * pan) + np.array([0, 0, 1]) * (dy * pan)
+
             scroll = imgui.get_io().mouse_wheel
             if abs(scroll) > 0.01:
-                S.cam_dist = max(0.3, S.cam_dist - scroll * zoom)
+                if free_mode:
+                    S.cam_free_pos += S._free_cam_forward() * scroll * zoom * 3.0
+                    S.cam_target    = S.cam_free_pos + S._free_cam_forward()
+                else:
+                    S.cam_dist = max(0.3, S.cam_dist - scroll * zoom)
 
-            # Keyboard
+        # ── Free-camera WASD + QE (Unity defaults) ────────────────────────
+        # Uses native pyglet key state (_keys_held) — reliable, frame-accurate.
+        # Active only when: free mode ON, mouse inside viewport, AND viewport
+        # was clicked to gain focus.
+        if free_mode and img_hovered and vp_focused and _keys_held:
+            dt_io    = imgui.get_io().delta_time
+            cam_spd  = 3.0
+            yr       = math.radians(S.cam_yaw)
+            pr       = math.radians(S.cam_pitch)
+            forward  = np.array([
+                math.cos(pr) * math.cos(yr),
+                math.cos(pr) * math.sin(yr),
+                math.sin(pr),
+            ])
+            right    = np.array([-math.sin(yr), math.cos(yr), 0.0])
+            world_up = np.array([0.0, 0.0, 1.0])
+            move     = np.zeros(3, dtype=np.float64)
+            if pyglet.window.key.W in _keys_held: move += forward
+            if pyglet.window.key.S in _keys_held: move -= forward
+            if pyglet.window.key.D in _keys_held: move -= right
+            if pyglet.window.key.A in _keys_held: move += right
+            if pyglet.window.key.E in _keys_held: move += world_up
+            if pyglet.window.key.Q in _keys_held: move -= world_up
+            mag = float(np.linalg.norm(move))
+            if mag > 1e-6:
+                S.cam_free_pos = S.cam_free_pos + (move / mag) * cam_spd * dt_io
+                S.cam_target   = S.cam_free_pos + forward
+
+        # ── Keyboard playback controls — active while viewport is hovered ─
+        if img_hovered:
             if imgui.is_key_pressed(_UI_KEY_SPACE, False):
                 if G.play_mode == "graph": G.toggle_graph_play(S.n_frames)
                 else:                      S.toggle_play()
@@ -613,9 +692,21 @@ def run_viewer(
 
     @win.event
     def on_key_press(sym, mods):
+        # Track held keys for free-cam movement (all backends)
+        if sym in _FREE_CAM_KEYS:
+            _keys_held.add(sym)
         if sym == pyglet.window.key.ESCAPE:
             logger.info("[viewer] ESC pressed — closing")
             win.close()
+
+    @win.event
+    def on_key_release(sym, mods):
+        _keys_held.discard(sym)
+
+    @win.event
+    def on_deactivate():
+        # Window lost OS focus — clear all held keys so nothing gets "stuck"
+        _keys_held.clear()
 
 
     @win.event

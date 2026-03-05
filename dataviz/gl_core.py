@@ -476,6 +476,18 @@ def _persp(fov: float, asp: float, near: float, far: float) -> np.ndarray:
     ], dtype=np.float32)
 
 
+def _ortho(half_h: float, asp: float, near: float, far: float) -> np.ndarray:
+    """Symmetric orthographic projection (OpenGL convention)."""
+    r  = half_h * asp
+    nf = 1.0 / (near - far)
+    return np.array([
+        [1/r, 0,    0,         0            ],
+        [0,   1/half_h, 0,     0            ],
+        [0,   0,    2*nf,      (far+near)*nf],
+        [0,   0,    0,         1            ],
+    ], dtype=np.float32)
+
+
 def _lookat(eye: np.ndarray, tgt: np.ndarray, up: np.ndarray) -> np.ndarray:
     eye = np.array(eye, dtype=np.float64)
     f   = np.array(tgt, dtype=np.float64) - eye
@@ -727,21 +739,30 @@ def render_3d(tab, gl: GLResources, vp_w: int, vp_h: int) -> None:
 
     glViewport(0, 0, vp_w, vp_h)
 
-    bg = _cfg_mod.CFG.colors.background if _cfg_mod.CFG else [0.52, 0.60, 0.68, 1.0]
+    if getattr(S, "bg_custom", False):
+        bg = list(getattr(S, "bg_color", [0.52, 0.60, 0.68, 1.0]))
+    else:
+        bg = _cfg_mod.CFG.colors.background if _cfg_mod.CFG else [0.52, 0.60, 0.68, 1.0]
     glClearColor(*bg)
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL)
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
     eye  = S.cam_eye()
-    proj = _persp(60.0, vp_w / max(1, vp_h), 0.01, 500.0)
+    asp  = vp_w / max(1, vp_h)
+    if getattr(S, "cam_ortho", False):
+        half_h = float(getattr(S, "cam_ortho_scale", 3.0))
+        proj = _ortho(half_h, asp, 0.01, 500.0)
+    else:
+        fov  = float(getattr(S, "cam_fov", 60.0))
+        proj = _persp(fov, asp, 0.01, 500.0)
     view = _lookat(eye, S.cam_target, [0, 0, 1])
     mvp  = proj @ view
 
     fog_s = S.fog_start
     fog_e = S.fog_end
 
-    if S.show_grid:
+    if S.show_grid and getattr(S, "show_ground", True):
         draw_ground(gl, proj, view, eye, S.cam_target, fog_s, fog_e)
 
     L = 0.4
@@ -799,6 +820,38 @@ def render_3d(tab, gl: GLResources, vp_w: int, vp_h: int) -> None:
                 ghost_col, proj, view, eye, ghost_alpha, fog_s, fog_e,
             )
 
+    # ── Trail Frames ──────────────────────────────────────────────────────
+    # Shows N previous robot poses at fixed frame intervals behind S.frame.
+    # Completely independent of the ghost robot — ghost is untouched above.
+    # Alpha fades linearly from ~0.45 (most recent trail) to ~0.10 (oldest).
+    if S.show_trail_frames and S.n_frames > 0:
+        trail_col = (
+            tuple(_cfg_mod.CFG.colors.robot_main[:3])
+            if _cfg_mod.CFG else (0.92, 0.92, 0.94)
+        )
+        n_trail  = max(1, S.trail_num_frames)
+        interval = max(1, S.trail_min_dist)
+        op_start = float(getattr(S, "trail_opacity_start", 0.45))
+        op_end   = float(getattr(S, "trail_opacity_end",   0.06))
+        for i in range(1, n_trail + 1):
+            tf = S.frame - i * interval
+            if tf < 0:
+                continue
+            # Lerp: i=1 → op_start (most recent), i=n_trail → op_end (oldest)
+            t     = (i - 1) / max(n_trail - 1, 1)
+            alpha = op_start + (op_end - op_start) * t
+            alpha = max(0.01, min(1.0, alpha))
+            tq, tpos, trpy = S.frame_state(tf)
+            trail_T = tab.fk_fn(tq, tpos, trpy)
+            for link_name, mesh_key in tab.LINK_TO_MESH.items():
+                if link_name not in trail_T or mesh_key not in tab.MESH_VAOS:
+                    continue
+                vao, n_idx = tab.MESH_VAOS[mesh_key]
+                draw_mesh(
+                    vao, n_idx, gl.prog_lit, trail_T[link_name],
+                    trail_col, proj, view, eye, alpha, fog_s, fog_e,
+                )
+
     # ── Raibert visualization config ──────────────────────────────────────
     # Raibert data availability
     _raibert_land = S.data.get("raibert_land")   # (N, 4, 3) body-origin-relative (needs +torso XY)
@@ -852,7 +905,7 @@ def render_3d(tab, gl: GLResources, vp_w: int, vp_h: int) -> None:
         cv    = S.data.get(f"contact_{lbl}")
         in_c  = cv is not None and cv[S.frame] > 0.5
         fc    = (0.1, 1.0, 0.4) if (S.show_contacts and in_c) else (0.15, 0.15, 0.15)
-        if S.show_contacts:
+        if getattr(S, "show_contact_spheres", True):
             draw_sphere(gl, foot_pos, 0.025, fc, proj, view, eye, fog_s, fog_e)
 
         # Force arrow

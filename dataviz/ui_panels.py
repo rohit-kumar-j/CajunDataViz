@@ -223,6 +223,17 @@ except AttributeError:
     except AttributeError:
         _UI_KEY_SPACE = 32; _UI_KEY_LEFT = 262; _UI_KEY_RIGHT = 263
 
+# Free-camera movement keys (Unity-style: WASD + QE)
+try:
+    _UI_KEY_W = imgui.Key.w; _UI_KEY_S = imgui.Key.s
+    _UI_KEY_A = imgui.Key.a; _UI_KEY_D = imgui.Key.d
+    _UI_KEY_Q = imgui.Key.q; _UI_KEY_E = imgui.Key.e
+except AttributeError:
+    # Fallback: GLFW / ASCII uppercase key codes
+    _UI_KEY_W = 87; _UI_KEY_S = 83
+    _UI_KEY_A = 65; _UI_KEY_D = 68
+    _UI_KEY_Q = 81; _UI_KEY_E = 69
+
 try:
     _UI_INPUT_TEXT_ENTER = imgui.InputTextFlags_.enter_returns_true
 except AttributeError:
@@ -1466,10 +1477,19 @@ def render_settings(tab: TabState, ui: UIState) -> None:
     imgui.separator()
 
     if imgui.radio_button("Follow Main##fm",  S.cam_follow_mode == "main"):
-        S.cam_follow_mode = "main";  S.update_cam()
+        if S.cam_follow_mode == "free": S.exit_free_cam("main")
+        else: S.cam_follow_mode = "main"; S.update_cam()
     imgui.same_line()
     if imgui.radio_button("Follow Ghost##fg", S.cam_follow_mode == "ghost"):
-        S.cam_follow_mode = "ghost"; S.update_cam()
+        if S.cam_follow_mode == "free": S.exit_free_cam("ghost")
+        else: S.cam_follow_mode = "ghost"; S.update_cam()
+    imgui.same_line()
+    if imgui.radio_button("Free##fc", S.cam_follow_mode == "free"):
+        if S.cam_follow_mode != "free":
+            S.enter_free_cam()
+    if S.cam_follow_mode == "free":
+        imgui.same_line()
+        imgui.text_colored((0.55, 0.85, 0.55, 1.0), "  WASD / QE to fly")
 
     imgui.push_item_width(sc(80))
     cv, vv = imgui.drag_float("Yaw##cy",   S.cam_yaw,   0.5, -180, 180, "%.0f°")
@@ -1487,18 +1507,167 @@ def render_settings(tab: TabState, ui: UIState) -> None:
         S.cam_pitch = _cfg_mod.CFG.camera.default_pitch  if _cfg_mod.CFG else 25.0
         S.cam_dist  = _cfg_mod.CFG.camera.default_dist   if _cfg_mod.CFG else 3.5
 
+    # FOV — drag left for telephoto (near-orthographic), right for wide-angle
+    imgui.push_item_width(sc(100))
+    cv, vv = imgui.drag_float(
+        "FOV##cfov", getattr(S, "cam_fov", 60.0), 0.5, 5.0, 120.0, "%.0f°"
+    )
+    if cv:
+        S.cam_fov = max(5.0, min(120.0, vv))
+    imgui.pop_item_width()
+    imgui.same_line()
+    imgui.text_disabled("(low = telephoto / near-ortho)")
+
+    # Orthographic toggle — overrides FOV when enabled
+    ortho = getattr(S, "cam_ortho", False)
+    _ui_push_style_color(
+        imgui.Col_.check_mark,
+        *(0.40, 0.85, 1.00, 1.0) if ortho else (0.5, 0.5, 0.5, 1.0),
+    )
+    ch, ortho = imgui.checkbox("Orthographic##cortho", ortho)
+    imgui.pop_style_color()
+    if ch:
+        S.cam_ortho = ortho
+    if ortho:
+        imgui.same_line()
+        imgui.push_item_width(sc(80))
+        cv, vv = imgui.drag_float(
+            "Scale##cos", getattr(S, "cam_ortho_scale", 3.0),
+            0.05, 0.2, 50.0, "%.1fm"
+        )
+        if cv:
+            S.cam_ortho_scale = max(0.2, vv)
+        imgui.pop_item_width()
+        imgui.same_line()
+        imgui.text_disabled("(half-height)")
+
     imgui.spacing()
     imgui.text_colored((0.65, 0.75, 0.88, 1), "OVERLAYS")
     imgui.separator()
-    _, S.show_forces       = imgui.checkbox("Forces##sf",   S.show_forces);       imgui.same_line()
-    _, S.show_contacts     = imgui.checkbox("Contacts##sc", S.show_contacts);     imgui.same_line()
+    _, S.show_forces       = imgui.checkbox("Force Arrows##sf",   S.show_forces);       imgui.same_line()
+    _, S.show_contact_spheres = imgui.checkbox("Contact Spheres##scs", getattr(S, "show_contact_spheres", True))
+    S.show_contact_spheres = _  ; imgui.same_line()
+    _, S.show_contacts     = imgui.checkbox("Contact Color##sc", S.show_contacts);     imgui.same_line()
     _, S.show_limits       = imgui.checkbox("Limits##sl",   S.show_limits);       imgui.same_line()
     _, S.show_grid         = imgui.checkbox("Grid##sg",     S.show_grid);         imgui.same_line()
     _, S.show_trajectory   = imgui.checkbox("Traj##st",     S.show_trajectory);   imgui.same_line()
-    _, S.show_joint_frames = imgui.checkbox("JFrames##sjf", S.show_joint_frames); imgui.same_line()
-    # show_raibert_boxes was added in a previous session — guard against old state objects
+    _, S.show_joint_frames = imgui.checkbox("JFrames##sjf", S.show_joint_frames)
+
+    # Residual bounds on its own row so it's clearly visible
     if hasattr(S, "show_raibert_boxes"):
-        _, S.show_raibert_boxes = imgui.checkbox("Raibert##srb", S.show_raibert_boxes)
+        _ui_push_style_color(
+            imgui.Col_.check_mark,
+            *(0.95, 0.70, 0.20, 1.0) if S.show_raibert_boxes else (0.5, 0.5, 0.5, 1.0),
+        )
+        _, S.show_raibert_boxes = imgui.checkbox(
+            "Residual Bounds (Raibert boxes)##srb", S.show_raibert_boxes
+        )
+        imgui.pop_style_color()
+
+    # ── Ground + Background — screenshot helpers ──────────────────────────
+    imgui.spacing()
+    imgui.text_colored((0.65, 0.75, 0.88, 1), "GROUND & BACKGROUND")
+    imgui.separator()
+    show_ground = getattr(S, "show_ground", True)
+    _ui_push_style_color(
+        imgui.Col_.check_mark,
+        *(0.55, 0.85, 0.55, 1.0) if show_ground else (0.5, 0.5, 0.5, 1.0),
+    )
+    _, show_ground = imgui.checkbox("Show Ground##sground", show_ground)
+    imgui.pop_style_color()
+    S.show_ground = show_ground
+    imgui.same_line()
+
+    bg_custom = getattr(S, "bg_custom", False)
+    _ui_push_style_color(
+        imgui.Col_.check_mark,
+        *(0.40, 0.80, 1.00, 1.0) if bg_custom else (0.5, 0.5, 0.5, 1.0),
+    )
+    _, bg_custom = imgui.checkbox("Custom Background##sbgc", bg_custom)
+    imgui.pop_style_color()
+    S.bg_custom = bg_custom
+
+    if bg_custom:
+        imgui.same_line()
+        bg = list(getattr(S, "bg_color", [0.52, 0.60, 0.68, 1.0]))
+        # Ensure exactly 4 floats
+        while len(bg) < 4: bg.append(1.0)
+        try:
+            ch, new_bg = imgui.color_edit4(
+                "##bgcol",
+                tuple(bg[:4]),
+                imgui.ColorEditFlags_.no_label |
+                imgui.ColorEditFlags_.alpha_bar |
+                imgui.ColorEditFlags_.picker_hue_wheel,
+            )
+        except Exception:
+            # Fallback for imgui variants that don't accept flags
+            ch, new_bg = imgui.color_edit4("##bgcol", tuple(bg[:4]))
+        if ch:
+            S.bg_color = list(new_bg)
+
+    # ── Trail Frames — separate from ghost robot ──────────────────────────
+    imgui.spacing()
+    imgui.text_colored((0.65, 0.75, 0.88, 1), "TRAIL FRAMES")
+    imgui.separator()
+    if hasattr(S, "show_trail_frames"):
+        _ui_push_style_color(
+            imgui.Col_.check_mark,
+            *(0.35, 1.00, 0.60, 1.0) if S.show_trail_frames else (0.5, 0.5, 0.5, 1.0),
+        )
+        _, S.show_trail_frames = imgui.checkbox(
+            "Enable Trail Frames##etf", S.show_trail_frames
+        )
+        imgui.pop_style_color()
+
+        if S.show_trail_frames:
+            imgui.same_line()
+            imgui.push_item_width(sc(58))
+            cv, vv = imgui.drag_int(
+                "Count##tfn", S.trail_num_frames, 1, 1, 20, "%d poses"
+            )
+            if cv:
+                S.trail_num_frames = max(1, min(20, vv))
+            imgui.pop_item_width()
+            imgui.same_line()
+            imgui.push_item_width(sc(72))
+            cv, vv = imgui.drag_int(
+                "Interval##tfd", S.trail_min_dist, 1, 1, 500, "%d fr"
+            )
+            if cv:
+                S.trail_min_dist = max(1, vv)
+            imgui.pop_item_width()
+            imgui.same_line()
+            # Info: total frames covered by the trail
+            total_covered = S.trail_num_frames * S.trail_min_dist
+            imgui.text_disabled(f"({total_covered} fr back)")
+
+            # Opacity start / end — second row (drag_float: click-drag or ctrl+click to type)
+            imgui.indent(sc(4))
+            imgui.text_colored((0.65, 0.65, 0.72, 1.0), "Opacity:")
+            imgui.same_line()
+            imgui.text_colored((0.80, 0.90, 0.65, 1.0), "Start")
+            imgui.same_line()
+            imgui.push_item_width(sc(62))
+            cv, vv = imgui.drag_float(
+                "##tops", S.trail_opacity_start, 0.01, 0.0, 1.0, "%.2f"
+            )
+            if cv:
+                S.trail_opacity_start = max(0.0, min(1.0, vv))
+            imgui.pop_item_width()
+            imgui.same_line(spacing=sc(10))
+            imgui.text_colored((0.65, 0.75, 0.95, 1.0), "End")
+            imgui.same_line()
+            imgui.push_item_width(sc(62))
+            cv, vv = imgui.drag_float(
+                "##tope", S.trail_opacity_end, 0.01, 0.0, 1.0, "%.2f"
+            )
+            if cv:
+                S.trail_opacity_end = max(0.0, min(1.0, vv))
+            imgui.pop_item_width()
+            imgui.same_line(spacing=sc(10))
+            imgui.text_disabled("[0.0–1.0  ctrl+click to type]")
+            imgui.unindent(sc(4))
 
     imgui.spacing()
     imgui.text_colored((0.65, 0.75, 0.88, 1), "FOG")

@@ -32,14 +32,36 @@ class AppState:
         self.cam_dist:   float          = _cfg_mod.CFG.camera.default_dist   if _cfg_mod.CFG else 3.5
         self.cam_target: np.ndarray     = np.array([0.0, 0.0, 0.3])
         self.cam_follow_mode: str       = "main"
+        # Free-cam eye position (used when cam_follow_mode == "free")
+        self.cam_free_pos:   np.ndarray = np.array([0.0, 0.0, 1.5])
 
-        self.show_forces:       bool = True
-        self.show_contacts:     bool = True
-        self.show_limits:       bool = True
+        self.cam_fov:         float = 60.0   # vertical FOV in degrees; low values → telephoto/near-ortho
+        self.cam_ortho:       bool  = False  # true orthographic projection (overrides FOV)
+        self.cam_ortho_scale: float = 3.0    # half-height of ortho frustum in metres
+
+        self.show_ground:     bool  = True   # draw checkerboard ground
+        self.bg_custom:       bool  = False  # use custom background color (for screenshots)
+        self.bg_color:        list  = [0.52, 0.60, 0.68, 1.0]  # custom RGBA background
+
+        self.show_forces:          bool = True
+        self.show_contacts:        bool = True
+        self.show_contact_spheres: bool = True   # draw foot spheres (green=contact, dark=no contact)
+        self.show_limits:          bool = True
         self.show_grid:         bool = True
         self.show_trajectory:   bool = False
         self.show_joint_frames: bool = False
-        self.show_raibert_boxes: bool = True   # ← NEW: toggle Raibert boxes/arrows
+        self.show_raibert_boxes: bool = True   # ← toggle Raibert boxes/arrows
+
+        # ── Trail Frames — separate from ghost robot ───────────────────────
+        self.show_trail_frames:   bool  = False
+        self.trail_num_frames:    int   = 5      # how many trail poses to show
+        self.trail_min_dist:      int   = 15     # frame interval between each trail pose
+        self.trail_opacity_start: float = 0.45   # opacity of the most-recent trail pose
+        self.trail_opacity_end:   float = 0.06   # opacity of the oldest trail pose
+
+        # ── Free-cam orbit backup — saved when entering free mode ──────────
+        self._orbit_yaw_bak:   float = self.cam_yaw
+        self._orbit_pitch_bak: float = self.cam_pitch
 
         self.realtime_mode:      bool  = False  # play at 1× wall-clock speed using time.txt
         self._realtime_start_wall: float = 0.0  # wall-clock time when realtime play began
@@ -155,7 +177,38 @@ class AppState:
         self.frame = lo + (self.frame - lo + steps) % span
         self._sync_cam()
 
+    def enter_free_cam(self) -> None:
+        """Switch to free camera. Eye stays at current orbit position; look
+        direction is set to point toward the current camera target so the
+        view does not jump at all."""
+        # Save orbit yaw/pitch so we can restore them when leaving free mode
+        self._orbit_yaw_bak   = self.cam_yaw
+        self._orbit_pitch_bak = self.cam_pitch
+        # Snap free-cam eye to the current orbit eye position
+        self.cam_free_pos = self.cam_eye().copy()
+        # Derive free-cam yaw/pitch from the actual look direction
+        # (orbit: eye looks TOWARD target; free: angles encode the FORWARD vec)
+        look = self.cam_target - self.cam_free_pos
+        norm = float(np.linalg.norm(look))
+        if norm > 1e-6:
+            look = look / norm
+            self.cam_pitch = float(math.degrees(math.asin(float(np.clip(look[2], -1.0, 1.0)))))
+            self.cam_yaw   = float(math.degrees(math.atan2(float(look[1]), float(look[0]))))
+        self.cam_follow_mode = "free"
+        self.cam_target = self.cam_free_pos + self._free_cam_forward()
+
+    def exit_free_cam(self, mode: str = "main") -> None:
+        """Leave free camera and restore the saved orbit yaw/pitch."""
+        self.cam_yaw         = self._orbit_yaw_bak
+        self.cam_pitch       = self._orbit_pitch_bak
+        self.cam_follow_mode = mode
+        self.update_cam()
+
     def update_cam(self) -> None:
+        if self.cam_follow_mode == "free":
+            # Keep cam_target 1 unit ahead so _lookat stays valid
+            self.cam_target = self.cam_free_pos + self._free_cam_forward()
+            return
         if self.data is None:
             return
         G = self.g_ref
@@ -168,9 +221,24 @@ class AppState:
         ])
 
     def _sync_cam(self) -> None:
+        if self.cam_follow_mode == "free":
+            self.cam_target = self.cam_free_pos + self._free_cam_forward()
+            return
         self.update_cam()
 
+    def _free_cam_forward(self) -> np.ndarray:
+        """Unit vector in the direction the free camera is looking."""
+        yr = math.radians(self.cam_yaw)
+        pr = math.radians(self.cam_pitch)
+        return np.array([
+            math.cos(pr) * math.cos(yr),
+            math.cos(pr) * math.sin(yr),
+            math.sin(pr),
+        ], dtype=np.float64)
+
     def cam_eye(self) -> np.ndarray:
+        if self.cam_follow_mode == "free":
+            return self.cam_free_pos.copy()
         min_p = _cfg_mod.CFG.camera.min_pitch if _cfg_mod.CFG else 5.0
         max_p = _cfg_mod.CFG.camera.max_pitch if _cfg_mod.CFG else 85.0
         yr = math.radians(self.cam_yaw)
